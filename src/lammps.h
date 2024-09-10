@@ -23,16 +23,30 @@
 #include <unistd.h>
 #include "utils.h"
 #include <mutex>
+#include <sys/types.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
+#include <sys/ipc.h>
+#include <numa.h>
+#include <numaif.h>
 
+#define RPROC   124
 #define DIM_NUM 62
+#define EXCH_SWAP_NUM 26
 #define SWAP_NUM DIM_NUM*2
 #define TNI_NUM 6
-#define VCQ_NUM 4
-#define XMIT_TYPE_NUM 4
+#define VCQ_NUM 3
+#define NUMA_GROUP_NUM 2
+// #define XMIT_TYPE_NUM 4
+
 #define THREAD_NUM 11
+#define COMM_TNUM  6
 #define THREAD_STRIDE 5
 #define T_THREAD 12
+#define NUMA_NUM 4
+#define FORCE_OFFSET 108
 
+#define SHARE_DATA_LENGTH 163840
 
 #define OPT_NEWTON
 
@@ -41,6 +55,7 @@
 
 #define OPT_COMM_TEST
 // #define DEBUG_MSG 1
+
 
 namespace LAMMPS_NS {
 
@@ -62,6 +77,7 @@ class LAMMPS {
   class Group *group;              // groups of atoms
   class Output *output;            // thermo/dump/restart
   class Timer *timer;              // CPU timing info
+  class Timer *self_timer;              // CPU timing info
                                    //
   class KokkosLMP *kokkos;         // KOKKOS accelerator class
   class AtomKokkos *atomKK;        // KOKKOS version of Atom class
@@ -73,19 +89,24 @@ class LAMMPS {
   enum Fun_type{
     FORWARD_XMIT      = 0x01,
     REVERSE_XMIT      = 0x02,
-
-    BORDER_XMIT       = 0x03,
-    BORDERS_SENDLIST  = 0x04,
-    BORDERS_XMIT_BUF  = 0x05,
-    BORDERS_FIRSTRECV = 0x06,
-    BORDERS_XMIT_POS  = 0x07,
-    BORDERS_FINISH    = 0x08,
-
+    BORDER_NUMA       = 0x03,
+    FORWARD_NUMA      = 0x04,
+    REVERSE_NUMA      = 0x05,
+    EXCHANGE_NUMA     = 0x06,
+    NUMA_SHARE_ATOM   = 0x07,
     EXCHANGE_XMIT     = 0x09,
-    NEIGHBOR_BUILD     = 0x0a,
-    PAIR_COMPUTE       = 0x0b,
-    PRE_FORCE_P       = 0x0c
+    NEIGHBOR_BUILD    = 0x0a,
+    PAIR_COMPUTE      = 0x0b,
+    PRE_FORCE_P       = 0x0c,
+    BORDER_COMBINE    = 0x0d,
+    PAIR_NUMA         = 0x0e,
+    NUMA_ATOM_INIT    = 0x10,
+    NEIGHBOR_NUMA     = 0x0f,
+    INIT_INTEG_NUMA     = 0x11,
+    FINI_INTEG_NUMA     = 0x12
   };
+
+  uint64_t excutions[32] = {0};
 
   pthread_t lmp_threads[THREAD_NUM];
   std::atomic<uint64_t> is_excute;
@@ -102,19 +123,31 @@ class LAMMPS {
   bool is_shutdown_ = false;
   static LAMMPS* curMy;
 
+  int numa_id;
+
+  bool temp_first = true;
+
+  bool stop_flag = false;
+
   void parral_barrier(int t_num = 12, int tid = 0);
 
 
   static void* callback(void* arg){  
     // utils::logmesg(LAMMPS::curMy, " callback create tid {} \n", int(arg)); 
-    LAMMPS::curMy->parral_fun(int(arg));  
+    LAMMPS::curMy->parral_fun((int)(size_t)(arg));  
     return NULL;  
   }  
+
+  void init_excutions();
 
   void execute(enum Fun_type);
   void parral_fun(int);
   void pthread_pool_start();
   void pthread_test();
+
+  class DeepPot **deep_pots;
+
+
 
   pthread_barrier_t barrier_12;
 
@@ -133,6 +166,9 @@ class LAMMPS {
                           // file, in case LAMMPS was initialized from a restart
                           //
   MPI_Comm world;         // MPI communicator
+  MPI_Comm nuworld;
+  MPI_Comm m_world;
+
   FILE *infile;           // infile
   FILE *screen;           // screen output
   FILE *logfile;          // logfile

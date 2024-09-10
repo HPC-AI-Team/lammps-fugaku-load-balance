@@ -1,0 +1,43 @@
+#!/bin/sh -x
+#PJM -L  "freq=2200"
+#PJM -L  "node=16x18x16"
+#PJM --mpi "shape=16x18x16"
+#PJM -L  "rscgrp=large,eco_state=2"
+#PJM -L  "elapse=00:20:00"
+#PJM --mpi "max-proc-per-node=4"
+#PJM -g hp230257
+#PJM -s
+#
+
+# 8x12x8=768
+# 12x15x12=2160
+# 16x18x16=4068
+# 16x24x16=6144
+# 20x30x20=12000
+# 24x32x24=18432
+# 32x36x32=36864
+# 36x36x36=46656
+module sw lang/tcsds-1.2.38
+
+export LD_LIBRARY_PATH=../OPENBLAS/lib:$LD_LIBRARY_PATH
+export OPENBLAS_NUM_THREADS=12
+
+export CBLAS_OPEN_FLAG=0
+export COMM_BORDER_ONE_FLAG=1
+export COMM_PIGGY_FLAG=0
+export THREAD_POOL_FLAG=1
+export NUMA_FLAG=1
+export AGGREGATE_FLAG=0
+export TEST_FP16=1
+export LOAD_BALANCE_FLAG=1
+export COMM_DEBUG_FLAG=0
+
+
+export LOAD_BALANCE_FLAG=1
+
+mpiexec  ./lmp_execute  -in ./in.deepmd_strong  
+sleep 5
+mpiexec  ./lmp_execute  -in ./in.deepmd_strong  
+sleep 5
+mpiexec  ./lmp_execute  -in ./in.deepmd_strong  
+sleep 5

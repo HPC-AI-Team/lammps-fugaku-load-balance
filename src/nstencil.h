@@ -27,6 +27,11 @@ class NStencil : protected Pointers {
   int nstencil;                 // # of bins in stencil
   int *stencil;                 // list of bin offsets
   int **stencilxyz;             // bin offsets in xyz dims
+
+  int nunstencil;                 // # of bins in stencil
+  int *nustencil;                 // list of bin offsets
+  int **nustencilxyz;             // bin offsets in xyz dims
+
   int *nstencil_multi_old;      // # bins in each type-based old multi stencil
   int **stencil_multi_old;      // list of bin offsets in each stencil
   double **distsq_multi_old;    // sq distances to bins in each stencil
@@ -73,6 +78,7 @@ class NStencil : protected Pointers {
   // data from NBin class
 
   int mbinx, mbiny, mbinz;
+  int numbinx, numbiny, numbinz;
   double binsizex, binsizey, binsizez;
   double bininvx, bininvy, bininvz;
 

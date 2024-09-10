@@ -283,6 +283,89 @@ void AtomVec::grow(int n)
   grow_pointers();
 }
 
+void AtomVec::grow_init() {
+  int datatype, cols, maxcols;
+  void *pdata;
+  double cut , ndomain_max = 1;
+
+  domain_nmax_flag = true;
+
+  tag = memory->grow(atom->tag, nmax, "atom:tag");
+  type = memory->grow(atom->type, nmax, "atom:type");
+  mask = memory->grow(atom->mask, nmax, "atom:mask");
+  image = memory->grow(atom->image, nmax, "atom:image");
+  x = memory->grow(atom->x, nmax, 3, "atom:x");
+  v = memory->grow(atom->v, nmax, 3, "atom:v");
+  f = memory->grow(atom->f, nmax * comm->nthreads, 3, "atom:f");
+
+  for (int i = 0; i < ngrow; i++) {
+    pdata = mgrow.pdata[i];
+    datatype = mgrow.datatype[i];
+    cols = mgrow.cols[i];
+    const int nthreads = threads[i] ? comm->nthreads : 1;
+    if (datatype == Atom::DOUBLE) {
+      if (cols == 0)
+        memory->grow(*((double **) pdata), nmax * nthreads, "atom:dvec");
+      else if (cols > 0)
+        memory->grow(*((double ***) pdata), nmax * nthreads, cols, "atom:darray");
+      else {
+        maxcols = *(mgrow.maxcols[i]);
+        memory->grow(*((double ***) pdata), nmax * nthreads, maxcols, "atom:darray");
+      }
+    } else if (datatype == Atom::INT) {
+      if (cols == 0)
+        memory->grow(*((int **) pdata), nmax * nthreads, "atom:ivec");
+      else if (cols > 0)
+        memory->grow(*((int ***) pdata), nmax * nthreads, cols, "atom:iarray");
+      else {
+        maxcols = *(mgrow.maxcols[i]);
+        memory->grow(*((int ***) pdata), nmax * nthreads, maxcols, "atom:iarray");
+      }
+    } else if (datatype == Atom::BIGINT) {
+      if (cols == 0)
+        memory->grow(*((bigint **) pdata), nmax * nthreads, "atom:bvec");
+      else if (cols > 0)
+        memory->grow(*((bigint ***) pdata), nmax * nthreads, cols, "atom:barray");
+      else {
+        maxcols = *(mgrow.maxcols[i]);
+        memory->grow(*((bigint ***) pdata), nmax * nthreads, maxcols, "atom:barray");
+      }
+    }
+  }
+
+  for (int iextra = 0; iextra < atom->nextra_grow; iextra++)
+    modify->fix[atom->extra_grow[iextra]]->grow_arrays(nmax);
+
+  grow_pointers();
+}
+
+void AtomVec::determin_max()
+{
+  int datatype, cols, maxcols;
+  void *pdata;
+  double cut , ndomain_max = 1;
+
+  cut = comm->get_comm_cutoff();
+  ndomain_max = atom->natoms * (domain->lcl_prd[0]+2*cut) * (domain->lcl_prd[1]+2*cut) * (domain->lcl_prd[2]+2*cut) 
+                            / (domain->prd[0]) / (domain->prd[1]) / (domain->prd[2]) ;
+                            
+  ndomain_max = MAX((ndomain_max * 1.5), nmax);
+
+  ndomain_max *= NUMA_NUM;
+  if(comm->me == 0) utils::logmesg(lmp," ld_balance open {} \n", ndomain_max);
+
+  atom->nmax = nmax = ndomain_max;  
+  if(comm->me == 0) utils::logmesg(lmp," AtomVec nmax {} ndomain_max {} \n", nmax, ndomain_max);
+
+  if(DEBUG_MSG) utils::logmesg(lmp," AtomVec natoms {} nmax {} \n", atom->natoms, nmax);
+
+  if (nmax < 0 || nmax > MAXSMALLINT) error->one(FLERR, "Per-processor system is too big");  
+  
+  atom->nunlocal = atom->nlocal;
+  atom->nunghost = 0;
+}
+
+
 /* ----------------------------------------------------------------------
    copy atom I info to atom J
 ------------------------------------------------------------------------- */
@@ -459,6 +542,8 @@ int AtomVec::pack_comm(int n, int *list, double *buf, int pbc_flag, int *pbc)
 
   return m;
 }
+
+
 
 /* ---------------------------------------------------------------------- */
 
@@ -820,6 +905,10 @@ int AtomVec::pack_border(int n, int *list, double *buf, int pbc_flag, int *pbc)
   double dx, dy, dz;
   void *pdata;
 
+  // if(DEBUG_MSG) utils::logmesg(lmp, "[info] go into pack_border \n");
+
+  // utils::logmesg_arry(lmp, fmt::format("[INFO] pack_border sendlist "), list, n, 1); 
+
   m = 0;
   if (pbc_flag == 0) {
     for (i = 0; i < n; i++) {
@@ -910,6 +999,20 @@ int AtomVec::pack_border(int n, int *list, double *buf, int pbc_flag, int *pbc)
       m += modify->fix[atom->extra_border[iextra]]->pack_border(n, list, &buf[m]);
 
   return m;
+}
+
+
+int AtomVec::pack_border_numa(double *buf)
+{ 
+  int nlocal = atom->nlocal;
+  uint64_t offset = 0;
+  uintptr_t ptr = (uintptr_t)buf;
+  memcpy((void*)(ptr + offset), x[0], sizeof(double) * nlocal * 3); offset += sizeof(double) * nlocal * 3;
+  memcpy((void*)(ptr + offset), tag,  sizeof(tagint) * nlocal); offset += sizeof(tagint) * nlocal;
+  memcpy((void*)(ptr + offset), type, sizeof(int) * nlocal); offset += sizeof(int) * nlocal;
+  memcpy((void*)(ptr + offset), mask, sizeof(int) * nlocal); offset += sizeof(int) * nlocal;
+
+  return offset;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1103,6 +1206,17 @@ void AtomVec::unpack_border(int n, int first, double *buf)
   if (atom->nextra_border)
     for (int iextra = 0; iextra < atom->nextra_border; iextra++)
       m += modify->fix[atom->extra_border[iextra]]->unpack_border(n, first, &buf[m]);
+}
+
+
+void AtomVec::unpack_border_numa(int n, int first, double *buf)
+{
+  int nlocal = atom->nlocal;
+  uint64_t offset = 0;
+  memcpy(x[0] + first * sizeof(double) * 3, buf + offset, sizeof(double) * nlocal * 3);  offset += sizeof(double) * nlocal * 3;
+  memcpy(tag + first * sizeof(tagint),      buf + offset, sizeof(tagint) * nlocal);      offset += sizeof(tagint) * nlocal;
+  memcpy(type + first * sizeof(int),        buf + offset, sizeof(double) * nlocal);      offset += sizeof(double) * nlocal;
+  memcpy(mask+ first * sizeof(int),         buf + offset, sizeof(double) * nlocal);      offset += sizeof(double) * nlocal;
 }
 
 /* ---------------------------------------------------------------------- */

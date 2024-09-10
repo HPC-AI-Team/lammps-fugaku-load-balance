@@ -25,8 +25,6 @@
 #include "lmptype.h"    // IWYU pragma: export
 
 #include <mpi.h>        // IWYU pragma: export
-#include <omp.h>
-
 #include <cstddef>      // IWYU pragme: export
 #include <cstdio>       // IWYU pragma: export
 #include <string>       // IWYU pragma: export
@@ -87,7 +85,11 @@ class Pointers {
     group(ptr->group),
     output(ptr->output),
     timer(ptr->timer),
+    self_timer(ptr->self_timer),
+
     world(ptr->world),
+    nuworld(ptr->nuworld),
+    m_world(ptr->m_world),
     infile(ptr->infile),
     screen(ptr->screen),
     logfile(ptr->logfile),
@@ -121,8 +123,11 @@ class Pointers {
   Group *&group;
   Output *&output;
   Timer *&timer;
+  Timer *&self_timer;
 
   MPI_Comm &world;
+  MPI_Comm &nuworld;
+  MPI_Comm &m_world;
   FILE *&infile;
   FILE *&screen;
   FILE *&logfile;

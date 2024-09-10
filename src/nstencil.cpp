@@ -20,7 +20,7 @@
 #include "update.h"
 #include "domain.h"
 #include "memory.h"
-
+#include "comm.h"
 #include <cmath>
 
 using namespace LAMMPS_NS;
@@ -74,6 +74,8 @@ NStencil::NStencil(LAMMPS *lmp) : Pointers(lmp)
   maxstencil = maxstencil_multi_old = 0;
   stencil = nullptr;
   stencilxyz = nullptr;
+  nustencil = nullptr;
+  nustencilxyz = nullptr;
   nstencil_multi_old = nullptr;
   stencil_multi_old = nullptr;
   distsq_multi_old = nullptr;
@@ -180,6 +182,11 @@ void NStencil::copy_bin_info()
   mbinx = nb->mbinx;
   mbiny = nb->mbiny;
   mbinz = nb->mbinz;
+
+  numbinx = nb->numbinx;
+  numbiny = nb->numbiny;
+  numbinz = nb->numbinz;
+
   binsizex = nb->binsizex;
   binsizey = nb->binsizey;
   binsizez = nb->binsizez;
@@ -210,9 +217,7 @@ void NStencil::copy_bin_info_multi()
    insure stencils are allocated large enough
 ------------------------------------------------------------------------- */
 
-void NStencil::create_setup()
-{
-
+void NStencil::create_setup() {  
   if (neighstyle != Neighbor::MULTI) {
     if (nb) copy_bin_info();
     last_stencil = update->ntimestep;
@@ -231,6 +236,9 @@ void NStencil::create_setup()
 
     int smax = (2*sx+1) * (2*sy+1) * (2*sz+1);
 
+    if(DEBUG_MSG) utils::logmesg(lmp,"NStencil::create_setup smax {} maxstencil {} neighstyle {} \n", smax, maxstencil, neighstyle);
+
+
     // reallocate stencil structs if necessary
     // for BIN and MULTI_OLD styles
 
@@ -238,13 +246,15 @@ void NStencil::create_setup()
       if (smax > maxstencil) {
         maxstencil = smax;
         memory->destroy(stencil);
-        memory->create(stencil,maxstencil,"neighstencil:stencil");
-        // if (xyzflag) {
-          memory->destroy(stencilxyz);
-          memory->create(stencilxyz,maxstencil,3,"neighstencil:stencilxyz");
-        // }
-      }
+        memory->create(stencil,maxstencil,"neighstencil:stencil");        
+        memory->destroy(stencilxyz);
+        memory->create(stencilxyz,maxstencil,3,"neighstencil:stencilxyz");
 
+        memory->destroy(nustencil);
+        memory->create(nustencil,maxstencil,"neighstencil:nustencil");        
+        memory->destroy(nustencilxyz);
+        memory->create(nustencilxyz,maxstencil,3,"neighstencil:nustencilxyz");
+      }
     } else {
       int i;
       int n = atom->ntypes;

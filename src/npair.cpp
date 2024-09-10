@@ -133,6 +133,14 @@ void NPair::copy_bin_info()
   mbinylo = nb->mbinylo;
   mbinzlo = nb->mbinzlo;
 
+  numbins = nb->numbins;
+  numbinx = nb->numbinx;
+  numbiny = nb->numbiny;
+  numbinz = nb->numbinz;
+  numbinxlo = nb->numbinxlo;
+  numbinylo = nb->numbinylo;
+  numbinzlo = nb->numbinzlo;
+
   bininvx = nb->bininvx;
   bininvy = nb->bininvy;
   bininvz = nb->bininvz;
@@ -140,6 +148,10 @@ void NPair::copy_bin_info()
   atom2bin = nb->atom2bin;
   bins = nb->bins;
   binhead = nb->binhead;
+
+  nuatom2bin = nb->nuatom2bin;
+  nubins = nb->nubins;
+  nubinhead = nb->nubinhead;
 
   nbinx_multi = nb->nbinx_multi;
   nbiny_multi = nb->nbiny_multi;
@@ -168,6 +180,11 @@ void NPair::copy_stencil_info()
   nstencil = ns->nstencil;
   stencil = ns->stencil;
   stencilxyz = ns->stencilxyz;
+
+  nunstencil = ns->nunstencil;
+  nustencil = ns->nustencil;
+  nustencilxyz = ns->nustencilxyz;
+  
   nstencil_multi_old = ns->nstencil_multi_old;
   stencil_multi_old = ns->stencil_multi_old;
   distsq_multi_old = ns->distsq_multi_old;

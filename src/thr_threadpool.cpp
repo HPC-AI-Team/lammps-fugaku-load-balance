@@ -185,6 +185,7 @@ void ThrThreadpool::reduce_thr(void *style, const int eflag, const int vflag,
 
   int need_force_reduce = 1;
 
+  // lmp->parral_barrier(12, tid);
   // if(lmp->comm->debug_flag)  utils::logmesg(lmp,"[info] reduce_thr tid {} eflag {} vflag {} \n", tid, eflag, vflag);
 
 
@@ -222,12 +223,11 @@ void ThrThreadpool::reduce_thr(void *style, const int eflag, const int vflag,
 
       if(tid == 11) {
         FixThreadpool *fixThreadpool = dynamic_cast<FixThreadpool *>(lmp->modify->get_fix_by_id("threadpool"));
-
+        memset(pair->virial, 0, 6 * sizeof(double));
 
         // std::string mesg = " eng_vdwl and eng_coul : ";
         for(int i = 0; i < nthreads; i++) {
           ThrData *td = fixThreadpool->get_thr(i);
-
 
           if (eflag & ENERGY_GLOBAL) {
             pair->eng_vdwl += td->eng_vdwl;
@@ -462,7 +462,6 @@ void ThrThreadpool::reduce_thr(void *style, const int eflag, const int vflag,
   if (style == fix->last_omp_style) {
     if (need_force_reduce) {
       data_reduce_thr_threadpool(&(f[0][0]), nall, nthreads, 3, tid, lmp);
-
 
       fix->did_reduce();
     }

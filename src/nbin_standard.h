@@ -33,6 +33,11 @@ class NBinStandard : public NBin {
   void bin_atoms_setup(int) override;
   void setup_bins(int) override;
   void bin_atoms() override;
+
+  void bin_atoms_setup_numa(int) override;
+  void setup_bins_numa(int) override;
+  void bin_atoms_numa() override;
+
   double memory_usage() override;
 };
 

@@ -82,6 +82,12 @@ class NPair : protected Pointers {
   int *atom2bin, *bins;
   int *binhead;
 
+  int numbins;
+  int numbinx, numbiny, numbinz;
+  int numbinxlo, numbinylo, numbinzlo;
+  int *nuatom2bin, *nubins;
+  int *nubinhead;
+
   int *nbinx_multi, *nbiny_multi, *nbinz_multi;
   int *mbins_multi;
   int *mbinx_multi, *mbiny_multi, *mbinz_multi;
@@ -94,6 +100,10 @@ class NPair : protected Pointers {
   int nstencil;
   int *stencil;
   int **stencilxyz;
+
+  int nunstencil;
+  int *nustencil;
+  int **nustencilxyz;
   int *nstencil_multi_old;
   int **stencil_multi_old;
   double **distsq_multi_old;

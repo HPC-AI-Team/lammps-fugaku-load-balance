@@ -15,10 +15,43 @@
 #define LMP_COMM_H
 
 #include "pointers.h"    // IWYU pragma: export
+#include "utofu.h"
+#include "mpi-ext.h"
 
 namespace LAMMPS_NS {
 
+typedef struct shared_use_buffer {
+  std::atomic<uint64_t> a_written_s0[T_THREAD];
+  std::atomic<uint64_t> a_written_s1[T_THREAD];
+  double data[SHARE_DATA_LENGTH];
+} Share_numa_struct;
 
+typedef struct shared_mem_struct {
+  std::atomic<int> *a_written[T_THREAD];
+  std::atomic<int> *a_written_tt[T_THREAD];
+  std::atomic<int> *a_written_reverse[RPROC];
+  std::atomic<uint64_t> *a_written_s0[T_THREAD];
+  void *atom_bit_share;
+  void *atom_bit;
+  tagint *tag  ;
+  int *type ;
+  int *mask ;
+  imageint *image;
+  double **x;
+  double **v;
+  double **f;
+  double **opt_buf_send[VCQ_NUM];
+  double **opt_buf_recv[VCQ_NUM]; 
+  double **opt_force_recv[NUMA_NUM];      
+  uint64_t *opt_recvnum;
+  uint64_t *opt_sendnum;
+  uint64_t *shm_sendnum;
+  uint64_t *shm_nlocal;
+  uint64_t *shm_recvnum_numa;
+  uint64_t *shm_firstrecv_numa;
+  uint64_t *shm_numa_recvnum_numa[NUMA_NUM];
+  double *normal_data;
+} Share_mem_struct;
 
 class Comm : protected Pointers {
  public:
@@ -36,9 +69,29 @@ class Comm : protected Pointers {
                // MULTIOLD = multiold-type cutoff
 
   int c_vcq;
-  
 
-  int me, nprocs;               // proc info
+  int numa_id;
+  int node_id;
+
+  int *pair_index;
+  int pair_len;
+
+  int numa_nlocal[NUMA_NUM];
+  int numa_nlocal_all;
+
+  int lb_offset[NUMA_NUM];
+
+  int nlocal_offset[NUMA_NUM];
+
+  Share_mem_struct shm_st[NUMA_NUM];
+
+  int full_flag;
+
+  int numa_group_id[NUMA_GROUP_NUM];
+  int numa_oppo_id[NUMA_GROUP_NUM];
+  int numa_send_id[NUMA_GROUP_NUM];
+
+  int me, nprocs, nume;               // proc info
   int ghost_velocity;           // 1 if ghost atoms have velocity, 0 if not
   double cutghost[3];           // cutoffs used for acquiring ghost atoms
   double cutghostuser;          // user-specified ghost cutoff (mode == SINGLE)
@@ -56,19 +109,26 @@ class Comm : protected Pointers {
 
   // public settings specific to layout = UNIFORM, NONUNIFORM
 
-  int procgrid[3];                     // proc count assigned to each dim of 3d grid
+  int procgrid[3], nuprocgrid[3];                     // proc count assigned to each dim of 3d grid
   int user_procgrid[3];                // user request for proc counts in each dim
-  int myloc[3];                        // which proc I am in each dim, 0 to N-1
+  int myloc[3], numyloc[3];                        // which proc I am in each dim, 0 to N-1
   int procneigh[3][2];                 // my 6 neighboring procs, 0/1 = left/right
   double *xsplit, *ysplit, *zsplit;    // fractional (0-1) sub-domain sizes, includes 0/1
 
   int **opt_procneigh;
+  int **numa_procneigh;
 
-  bool comm_omp_flag;
+  bool cblas_open_flag;
   bool comm_piggy_flag;
   bool comm_border_one_flag;
   bool thread_pool_flag;
+  bool numa_flag;
+  bool lb_flag;
+  bool fp16_flag;
+
   bool debug_flag;
+
+  MPI_Comm nuworld;
 
   bool utofu_init_flag;
   int ***grid2proc;                    // which proc owns i,j,k loc in 3d grid
@@ -100,26 +160,28 @@ class Comm : protected Pointers {
   virtual void exchange() = 0;                     // move atoms to new procs
   virtual void borders() = 0;                      // setup list of atoms to comm
 
+  virtual void numa_shm_init() {};                     // move atoms to new procs
+
+
   virtual void opt_exchange() {};                     // move atoms to new procs
   virtual void opt_reverse_comm(){};                 // reverse comm of forces
   virtual void opt_borders(){};                      // setup list of atoms to comm
   virtual void opt_borders_one(){};                      // setup list of atoms to comm
 
-  virtual void borders_one_parral_sendlist(){};                      // setup list of atoms to comm
-  virtual void borders_one_parral_xmit(int){};                      // setup list of atoms to comm
-  virtual void borders_one_parral_firstrecv(){};                      // setup list of atoms to comm
-  virtual void borders_one_parral_xmit_pos(int){};                      // setup list of atoms to comm
-  virtual void borders_one_parral_finish(){};
+  virtual void borders_one_parrral(int){};
 
   virtual void forward_comm_parral(int) {};    // forward comm of atom coords
   virtual void reverse_comm_parral(int){};                 // reverse comm of forces
   virtual void reverse_comm_parral_unpack(){};                 // reverse comm of forces
 
+  virtual void borders_one_parrral_numa(int){};
+  virtual void forward_comm_parral_numa(int) {};    // forward comm of atom coords
+  virtual void reverse_comm_parral_numa(int){};                 // reverse comm of forces
+  virtual void reverse_comm_parral_unpack_numa(){};                 // reverse comm of forces
 
-
-  virtual void utofu_init(){};
+  virtual void utofu_init_opt(){};
+  virtual void utofu_init_numa(){};
   virtual void utofu_delete(){};
-  
 
   // forward/reverse comm from a Pair, Bond, Fix, Compute, Dump
 

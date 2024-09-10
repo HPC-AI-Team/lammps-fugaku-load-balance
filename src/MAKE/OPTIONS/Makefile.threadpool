@@ -7,12 +7,14 @@ SHELL = /bin/sh
 # specify flags and libraries needed for your compiler
 
 CC =		mpiFCCpx
-CCFLAGS =	-g -O3  -ltofucom -std=c++11 -mcpu=a64fx -march=armv8.3-a+sve # -fopenmp
+CCFLAGS =	-Ofast -Nclang -std=c++11 -mcpu=a64fx -march=armv8.3-a+sve+fp16
 SHFLAGS =	-fPIC
 DEPFLAGS =	-M
 
 LINK =		mpiFCCpx
-LINKFLAGS =	-g -O3   -ltofucom -std=c++11 -mcpu=a64fx -march=armv8.3-a+sve # -fopenmp
+
+LINKFLAGS =	-Ofast -Nclang -std=c++11 -mcpu=a64fx -march=armv8.3-a+sve+fp16
+#LIB = ../../../CBLAS/openblas/lib/libopenblas.a
 LIB = 
 SIZE =		size
 
@@ -61,6 +63,17 @@ FFT_LIB =
 # PATH = path(s) for JPEG library and/or PNG library
 # LIB = name(s) of JPEG library and/or PNG library
 
+# TF_INC  = 
+# TF_PATH = 
+# TF_LIB  = 
+
+CBLAS_PATH= -L../OPENBLAS/lib
+CBLAS_LIB = -lopenblas
+UTOFU_LIB = -ltofucom -lnuma 
+
+#UTOFU_LIB = -ltofucom -lnuma -lfjlapacksve -SSL2
+#UTOFU_LIB = -lfjlapacksve -SSL2 -ltofucom -lnuma
+
 JPG_INC =
 JPG_PATH =
 JPG_LIB =
@@ -77,9 +90,9 @@ JPG_LIB =
 include Makefile.package.settings
 include Makefile.package
 
-EXTRA_INC = $(LMP_INC) $(PKG_INC) $(MPI_INC) $(FFT_INC) $(JPG_INC) $(PKG_SYSINC)
-EXTRA_PATH = $(PKG_PATH) $(MPI_PATH) $(FFT_PATH) $(JPG_PATH) $(PKG_SYSPATH)
-EXTRA_LIB = $(PKG_LIB) $(MPI_LIB) $(FFT_LIB) $(JPG_LIB) $(PKG_SYSLIB) $(DYN_LIB)
+EXTRA_INC = $(LMP_INC) $(PKG_INC) $(MPI_INC) $(FFT_INC) $(JPG_INC) $(PKG_SYSINC) $(TF_INC)
+EXTRA_PATH = $(PKG_PATH) $(MPI_PATH) $(FFT_PATH) $(JPG_PATH) $(PKG_SYSPATH) $(TF_PATH) $(CBLAS_PATH)
+EXTRA_LIB = $(PKG_LIB) $(MPI_LIB) $(FFT_LIB) $(JPG_LIB) $(PKG_SYSLIB) $(DYN_LIB) $(TF_LIB) $(UTOFU_LIB) $(CBLAS_LIB)
 EXTRA_CPP_DEPENDS = $(PKG_CPP_DEPENDS)
 EXTRA_LINK_DEPENDS = $(PKG_LINK_DEPENDS)
 

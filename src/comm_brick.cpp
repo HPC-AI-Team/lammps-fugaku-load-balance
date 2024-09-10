@@ -32,12 +32,17 @@
 #include "update.h"
 #include "platform.h"
 #include "timer.h"
-
+#include "force.h"
 #include "thr_data.h"
 #include "modify.h"
+#include <stdlib.h>
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+
+#include <chrono>
+#include <thread>
 
 using namespace LAMMPS_NS;
 
@@ -52,7 +57,6 @@ using namespace LAMMPS_NS;
 #else
   #define COMM_STEP 1
 #endif
-
 
 
 /* ---------------------------------------------------------------------- */
@@ -73,6 +77,84 @@ CommBrick::CommBrick(LAMMPS *lmp) :
   buildMPIType();  
   first_init_flag = false;
 }
+
+inline uintptr_t align_cache_size(uintptr_t ptr) {
+  uintptr_t cache_size = sysconf(_SC_LEVEL1_ICACHE_LINESIZE);
+  ptr = ((ptr + cache_size - 1) / cache_size) * cache_size;
+  return ptr;
+}
+
+inline uintptr_t align_cache_size(uintptr_t ptr, uintptr_t add) {
+  ptr += add;
+  uintptr_t cache_size = sysconf(_SC_LEVEL1_ICACHE_LINESIZE);
+  ptr = ((ptr + cache_size - 1) / cache_size) * cache_size;
+  return ptr;
+}
+
+inline uintptr_t align_double(uintptr_t offset) {
+  offset = ((offset + sizeof(double) - 1) / sizeof(double)) * sizeof(double);
+  return offset;
+}
+
+inline uintptr_t get_align_border_ptr(uintptr_t n) {
+  n = n * (sizeof(double) * 3 + sizeof(int) * 3);
+  n = ((n + sizeof(double) - 1) / sizeof(double));
+  return n;
+}
+
+inline int find_rank_id_numa(int data, int *array, int length){
+  int ptr = -1;
+  for(int i = 0; i < length; i++) {
+    if(data == (array[i] / 4)) {
+      ptr = i;
+      return ptr;
+    }
+  }
+  return ptr;
+}
+
+inline int find_rank_id(int data, int *array, int length){
+  int ptr = -1;
+  for(int i = 0; i < length; i++) {
+    if(data == (array[i])) {
+      ptr = i;
+      return ptr;
+    }
+  }
+  return ptr;
+}
+
+inline void arm_store(int ptr, int data) {
+    __asm__ __volatile__(
+        "STR %1, [%0]"
+        : // 没有输出操作数
+        : "r" (ptr), "r" (data) // 输入操作数：内存地址和要存储的值
+        : "memory" // 告诉编译器内存内容被修改
+    );
+};
+
+inline void arm_barrier(uint64_t &data, uint64_t goal ) {
+    while(1) {
+      uint64_t result;
+      __asm__ __volatile__(
+          "ldr x0, %1;"      // 将 a 的地址加载到寄存器 r0，然后从该地址加载 a 的值
+          "mov x1, %2;"      // 将 a 的地址加载到寄存器 r0，然后从该地址加载 a 的值
+          "sub %0, x0, x1;"  // 执行减法 r0 - r1，并将结果存储在 result 中
+          : "=r" (result)    // 输出操作数
+          : "m" (data), "r" (goal) // 输入操作数（注意使用 "m" 约束来引用内存地址）
+          : "x0", "x1"      // 破坏描述
+      );
+
+      if(result) break;
+      else {
+          // printf("mem_barrier cq_id %d i %d iter %d recv %d\n", _cq_id, _i ,_iter, recv_buffer[_cq_id][_i][_pos]);  fflush(stdout);
+          // sleep(1);
+          // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      }
+    }; 
+    // printf("mem_barrier cq_id %d i %d iter %d recv %d\n", _cq_id, _i ,_iter, recv_buffer[_cq_id][_i][_pos]);  fflush(stdout);
+  };
+
 
 
 inline bool in_neighbor_box(double *x, double *sublo, double *subhi){
@@ -102,6 +184,7 @@ inline int atom2bin(double *x, double bin_split_line[3][2] ){
 inline bool isEqualBigger(double x, double y){
   return ((x - y) > 0) || std::fabs(x - y) < EPSINON_B; 
 }
+
 inline bool isEqualSmaller(double x, double y){
   return ((y - x) > 0) || std::fabs(y - x) < EPSINON_B; 
 }
@@ -168,7 +251,6 @@ void CommBrick::init_buffers()
   utofu_init_flag = false;
 
   CommBrick::grow_send(maxsend,2);
-
   memory->create(buf_recv,maxrecv,"comm:buf_recv");
 
   nswap = 0;
@@ -187,8 +269,7 @@ void CommBrick::init_buffers()
   }
 }
 
-void CommBrick::init_buffers_value()
-{
+void CommBrick::init_buffers_opt() {
   std::string mesg;
   double *sublo,*subhi, cutoff;
   double length[3];
@@ -198,6 +279,10 @@ void CommBrick::init_buffers_value()
 
   memory->create(opt_pbc_flag,  opt_maxswap,"comm:opt_pbc_flag");
   memory->create(opt_pbc,       opt_maxswap,6,"comm:opt_pbc");
+  memory->create(opt_pbc_flag_recv,  opt_maxswap,"comm:opt_pbc_flag_recv");
+  memory->create(opt_pbc_recv,       opt_maxswap,6,"comm:opt_pbc_recv");
+  // memory->create(opt_recv_pbc_flag,  opt_maxswap,   "comm:opt_recv_pbc_flag");
+  // memory->create(opt_recv_pbc,       opt_maxswap,6, "comm:opt_recv_pbc");
 
   memory->create(opt_size_reverse_send, opt_maxswap,"comm:opt_size_reverse_send");
   memory->create(opt_size_reverse_recv, opt_maxswap,"comm:opt_size_reverse_recv");
@@ -210,24 +295,31 @@ void CommBrick::init_buffers_value()
 
   memory->create(opt_sendproc, opt_maxswap,"comm:opt_sendproc");
   memory->create(opt_recvproc, opt_maxswap,"comm:opt_recvproc");
-
   memory->create(opt_maxsend, opt_maxswap,"comm:opt_maxsend");
   memory->create(opt_maxrecv, opt_maxswap,"comm:opt_maxrecv");
-
-  memory->create(opt_sendnum, opt_maxswap,"comm:opt_sendnum");
-  memory->create(opt_recvnum, opt_maxswap,"comm:opt_recvnum");
   memory->create(opt_forw_pos, opt_maxswap,"comm:opt_forw_pos");
   memory->create(opt_maxsendlist, opt_maxswap,"comm:opt_maxsendlist");
 
   memory->create(opt_slablo,opt_maxswap,3,"comm:opt_slablo");
   memory->create(opt_slabhi,opt_maxswap,3,"comm:opt_slabhi");
 
-
   opt_sendlist  = (int **) memory->smalloc(opt_maxswap*sizeof(int *),"comm:sendlist");
+
+  for(int i = 0; i < VCQ_NUM; i++) {
+    memory->create(opt_stadd_send_offset[i],opt_maxswap,"comm:opt_stadd_send_offset");
+    memory->create(opt_stadd_recv_offset[i],opt_maxswap,"comm:opt_stadd_recv_offset");
+  }
+
+  for(int i = 0; i < VCQ_NUM; i++) {
+    opt_buf_send[i] = (double **) memory->smalloc(opt_maxswap*sizeof(double *),"comm:opt_buf_send");
+    opt_buf_recv[i] = (double **) memory->smalloc(opt_maxswap*sizeof(double *),"comm:opt_buf_recv");
+  }
 
   sublo = domain->sublo;
   subhi = domain->subhi;
   cutoff = cutghost[0];
+
+  int density = + 1 + atom->natoms / ((domain->boxhi[0] - domain->boxlo[0]) * (domain->boxhi[1] - domain->boxlo[1]) *(domain->boxhi[2] - domain->boxlo[2])) ;
 
   for(int i = 0; i < 3; i++){
     length[i] = subhi[i] - sublo[i];
@@ -254,6 +346,10 @@ void CommBrick::init_buffers_value()
     }
   }
 
+  for(int i = 0; i < opt_maxswap; i++) opt_maxsendlist[i] *= density;
+
+  total_buffer_size = 0;
+
   for(int i = 0; i < opt_maxswap; i++) {
     opt_maxsendlist[i]  *= 2;
     if(opt_maxsendlist[i] < BUFMIN) {
@@ -261,51 +357,136 @@ void CommBrick::init_buffers_value()
     }
     opt_maxsend[i]      = opt_maxsendlist[i] * size_border;
     opt_maxrecv[i]      = opt_maxsend[i] ;
-  }
-  
-  for(int i = 0; i < VCQ_NUM; i++){
-      opt_buf_send[i] = (double **) memory->smalloc(opt_maxswap*sizeof(double *),"comm:opt_buf_send");
-      opt_buf_recv[i] = (double **) memory->smalloc(opt_maxswap*sizeof(double *),"comm:opt_buf_recv");
-  }
 
-  for(int i = 0; i < VCQ_NUM; i++){
-    for(int j = 0; j < opt_maxswap; j++) {
-      opt_buf_send[i][j] = opt_buf_recv[i][j] = nullptr;
+    total_buffer_size += opt_maxsend[i];
+  }
+  total_buffer_size *= 2 * VCQ_NUM;
+
+  opt_maxsend[0] *= NUMA_NUM;
+  total_buffer_size = opt_maxswap * opt_maxsend[0] * 2 * VCQ_NUM;
+
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[INFO] total_buffer_size {}\n", total_buffer_size);
+
+  if(!comm->numa_flag) {
+    memory->create(opt_recvnum, opt_maxswap,"comm:opt_recvnum");
+    memory->create(opt_sendnum, opt_maxswap,"comm:opt_sendnum");
+
+    all_recv_buffer = (double *) memory->smalloc(total_buffer_size*sizeof(double),"comm:all_recv_buffer");
+
+    uintptr_t cur_offset = 0;
+    for(int i = 0; i < VCQ_NUM; i++) {
+      for(int j = 0; j < opt_maxswap; j++) {
+        opt_buf_send[i][j] = all_recv_buffer + cur_offset; opt_stadd_send_offset[i][j] = cur_offset * sizeof(double); cur_offset += opt_maxsend[0];
+        opt_buf_recv[i][j] = all_recv_buffer + cur_offset; opt_stadd_recv_offset[i][j] = cur_offset * sizeof(double); cur_offset += opt_maxsend[0];
+      }
     }
   }
-
 
   for (int i = 0; i < opt_maxswap; i++) {
     memory->create(opt_sendlist[i],opt_maxsendlist[i],"comm:opt_sendlist[i]");
   }
 
-  for(int i = 0; i < VCQ_NUM; i++){
-    for(int j = 0; j < opt_maxswap; j++) {    
-      memory->create(opt_buf_send[i][j],opt_maxsend[i],"comm:opt_buf_send[iswap]");
-      memory->create(opt_buf_recv[i][j],opt_maxrecv[i],"comm:opt_buf_recv[iswap]");
+  // for(int i = 0; i < VCQ_NUM; i++)
+  //   for(int j = 0; j < opt_maxswap; j++) 
+  //     opt_buf_send[i][j] = opt_buf_recv[i][j] = nullptr;
+
+  // for(int i = 0; i < VCQ_NUM; i++){
+  //   for(int j = 0; j < opt_maxswap; j++) {    
+  //     memory->create(opt_buf_send[i][j],opt_maxsend[i],"comm:opt_buf_send[iswap]");
+  //     memory->create(opt_buf_recv[i][j],opt_maxrecv[i],"comm:opt_buf_recv[iswap]");
+  //     memset(opt_buf_recv[i][j], 0, sizeof(double) * opt_maxrecv[i]);
+  //   }
+  // }  
+}
+
+void CommBrick::init_buffers_numa()
+{
+  std::string mesg;
+  double cutoff, *nusublo,*nusubhi;
+  double length[3];
+
+  numa_maxswap = 2 * nundims;
+
+  memory->create(numa_pbc_flag,  numa_maxswap,"comm:numa_pbc_flag");
+  memory->create(numa_pbc,       numa_maxswap,6,"comm:numa_pbc");
+  memory->create(numa_pbc_flag_recv,  numa_maxswap,"comm:numa_pbc_flag_recv");
+  memory->create(numa_pbc_recv,       numa_maxswap,6,"comm:numa_pbc_recv");
+
+  memory->create(pair_index, atom->nmax,"comm:pair_index");
+
+  memory->create(numa_sendproc, numa_maxswap,"comm:numa_sendproc");
+  memory->create(numa_recvproc, numa_maxswap,"comm:numa_recvproc");
+  memory->create(numa_maxsend, numa_maxswap,"comm:numa_maxsend");
+  memory->create(numa_maxrecv, numa_maxswap,"comm:numa_maxrecv");
+  memory->create(numa_sendnum, numa_maxswap,"comm:numa_sendnum");
+  memory->create(numa_recvnum, numa_maxswap,"comm:numa_recvnum");
+  memory->create(numa_maxsendlist, numa_maxswap,"comm:numa_maxsendlist");
+
+  memory->create(opt_recvnum_numa, 4, opt_maxswap,"comm:opt_recvnum_numa");
+  memory->create(opt_firstrecv_numa, 4, opt_maxswap,"comm:opt_firstrecv_numa");
+  memory->create(opt2numa_swap, opt_maxswap,"comm:opt2numa_swap");
+
+  memory->create(numa_slablo,numa_maxswap,3,"comm:numa_slablo");
+  memory->create(numa_slabhi,numa_maxswap,3,"comm:numa_slabhi");
+
+  memory->create(numa_firstrecv,numa_maxswap,"comm:numa_slabhi");
+
+  nusublo = domain->nusublo;
+  nusubhi = domain->nusubhi;
+  cutoff = cutghost[0];
+
+  for(int i = 0; i < 3; i++){
+    length[i] = nusubhi[i] - nusublo[i];
+  }
+
+ if(ndims == 13) {
+    numa_maxsendlist[0] =  numa_maxsendlist[1] = length[1] * length[0] * cutoff;
+    numa_maxsendlist[2] =  numa_maxsendlist[3] = length[0] * length[2] * cutoff;
+    numa_maxsendlist[4] =  numa_maxsendlist[5] = length[2] * length[1] * cutoff;
+
+    numa_maxsendlist[6] =  numa_maxsendlist[7] = numa_maxsendlist[8] =  numa_maxsendlist[9] = 
+                                                              length[0] * cutoff * cutoff * 1.5;
+    numa_maxsendlist[10] =  numa_maxsendlist[11] = numa_maxsendlist[12] =  numa_maxsendlist[13] = 
+                                                              length[1] * cutoff * cutoff * 1.5;
+    numa_maxsendlist[14] =  numa_maxsendlist[15] = numa_maxsendlist[16] =  numa_maxsendlist[17] = 
+                                                              length[2] * cutoff * cutoff * 1.5;
+
+    for(int i = 18; i < numa_maxswap; i++){
+      numa_maxsendlist[i] = length[1] * cutoff * cutoff * 1.5;
+    }
+  } else {
+     for(int i = 0; i < numa_maxswap; i++){
+      numa_maxsendlist[i] = atom->nlocal * 1.5;
     }
   }
 
+  for(int i = 0; i < numa_maxswap; i++) {
+    numa_maxsendlist[i]  *= 2;
+    if(numa_maxsendlist[i] < BUFMIN) {
+      numa_maxsendlist[i] = BUFMIN;
+    }
+    numa_maxsend[i]      = numa_maxsendlist[i] * size_border;
+    numa_maxrecv[i]      = numa_maxsend[i] ;
+  }
 
   if(me == 0){
-    mesg = "[info] sendlist max : ";
-    for(int i = 0; i < opt_maxswap; i++) {
-      mesg += fmt::format(" {} ", opt_maxsendlist[i]);    
+    mesg = "[NUMA] sendlist max : ";
+    for(int i = 0; i < numa_maxswap; i++) {
+      mesg += fmt::format(" {} ", numa_maxsendlist[i]);
     }
     mesg += "\n";
     utils::logmesg(lmp,mesg);
-    mesg = "[info] opt_maxsend max : ";
-    for(int i = 0; i < opt_maxswap; i++) {
-      mesg += fmt::format(" {} ", opt_maxsend[i]);    
+    mesg = "[NUMA] numa_maxsend max : ";
+    for(int i = 0; i < numa_maxswap; i++) {
+      mesg += fmt::format(" {} ", numa_maxsend[i]);    
     }
     mesg += "\n";
     utils::logmesg(lmp,mesg);
   }
-
 }
 
 /* ---------------------------------------------------------------------- */
-
 void CommBrick::init()
 {
   Comm::init();
@@ -357,7 +538,6 @@ void CommBrick::init()
   }
 }
 
-
 /* ----------------------------------------------------------------------
    setup spatial-decomposition communication patterns
    function of neighbor cutoff(s) & cutghostuser & current box size
@@ -365,14 +545,13 @@ void CommBrick::init()
    multi mode sets collection-dependent slab boundaries (multilo,multihi)
    multi/old mode sets type-dependent slab boundaries (multioldlo,multioldhi)
 ------------------------------------------------------------------------- */
-double CommBrick::box_distance(int *dist)
-{
+double CommBrick::box_distance(const int *dist, double *lcl_prd) {
   double delx,dely,delz;
   double lcl_xprd, lcl_yprd, lcl_zprd; 
 
-  lcl_xprd = domain->lcl_xprd;
-  lcl_yprd = domain->lcl_yprd;
-  lcl_zprd = domain->lcl_zprd; 
+  lcl_xprd = lcl_prd[0];
+  lcl_yprd = lcl_prd[1];
+  lcl_zprd = lcl_prd[2]; 
 
   if (dist[0] > 0) delx = (dist[0]-1)*lcl_xprd;
   else if (dist[0] == 0) delx = 0.0;
@@ -389,9 +568,7 @@ double CommBrick::box_distance(int *dist)
   return (delx*delx + dely*dely + delz*delz);
 }
 
-
-void CommBrick::setup()
-{
+void CommBrick::setup() {
   // cutghost[] = max distance at which ghost atoms need to be acquired
   // for orthogonal:
   //   cutghost is in box coords = neigh->cutghost in all 3 dims
@@ -416,52 +593,12 @@ void CommBrick::setup()
   sublo = domain->sublo;
   subhi = domain->subhi;
   cutghost[0] = cutghost[1] = cutghost[2] = cut;
-
   
   cutneighmaxsq = neighbor->cutneighmaxsq;
 
-  memory->create(neigh_sublo,nprocs,3,"comm:neigh_sublo");
-  memory->create(neigh_subhi,nprocs,3,"comm:neigh_subhi");
-
-  MPI_Allgather(domain->sublo,3,MPI_DOUBLE,neigh_sublo[0],3,MPI_DOUBLE,world);
-  MPI_Allgather(domain->subhi,3,MPI_DOUBLE,neigh_subhi[0],3,MPI_DOUBLE,world);
-
-
-  for(i = 0; i < 62; i++){
-    if(box_distance(con_direction[i]) < cutneighmaxsq){
-      directions[ndims][0] = con_direction[i][0];
-      directions[ndims][1] = con_direction[i][1];
-      directions[ndims][2] = con_direction[i][2];
-      ndims++;
-    }
-  }
-
-  memory->create(opt_procneigh,ndims,2,"comm:opt_procneigh");
-
-  init_buffers_value();
-
-  if(me == 0) utils::logmesg(lmp,"[info] setup ndims {} opt_maxswap {}\n", ndims, opt_maxswap);
+  init_buffers();
 
   int ncoords[3]; 
-  for(dim = 0; dim < ndims; dim++) {
-    for(int i = 0; i < 2; i++) {
-      for(int j = 0; j < 3; j++) {
-        if(i%2 == 0)
-          ncoords[j] = myloc[j] - directions[dim][j];
-        else
-          ncoords[j] = myloc[j] + directions[dim][j];
-        
-        if(ncoords[j] < 0) ncoords[j] += procgrid[j];
-        if(ncoords[j] >= procgrid[j]) ncoords[j] -= procgrid[j];
-      }
-      opt_procneigh[dim][i] = grid2proc[ncoords[0]][ncoords[1]][ncoords[2]];
-    }
-  }
-
-    
-  if ((cut == 0.0) && (me == 0))
-    error->warning(FLERR,"Communication cutoff is 0.0. No ghost atoms "
-                   "will be generated. Atoms may get lost.");
 
   if (mode == Comm::MULTI) {
     double **cutcollectionsq = neighbor->cutcollectionsq;
@@ -665,128 +802,7 @@ void CommBrick::setup()
   int ineed, iswap;
 
   iswap = 0;
-
-  for(dim = 0; dim < ndims; dim++) {
-    for(ineed = 0; ineed < 2; ineed++) {
-      opt_pbc_flag[iswap] = 0;
-      opt_pbc[iswap][0] = opt_pbc[iswap][1] = opt_pbc[iswap][2] =
-        opt_pbc[iswap][3] = opt_pbc[iswap][4] = opt_pbc[iswap][5] = 0;
-      if(ineed %2 == 0){
-        opt_sendproc[iswap] = opt_procneigh[dim][0];
-        opt_recvproc[iswap] = opt_procneigh[dim][1];
-        swap_direct[iswap][0] = -directions[dim][0]; 
-        swap_direct[iswap][1] = -directions[dim][1]; 
-        swap_direct[iswap][2] = -directions[dim][2]; 
-      } else{
-        opt_sendproc[iswap] = opt_procneigh[dim][1];
-        opt_recvproc[iswap] = opt_procneigh[dim][0];
-        swap_direct[iswap][0] = directions[dim][0]; 
-        swap_direct[iswap][1] = directions[dim][1]; 
-        swap_direct[iswap][2] = directions[dim][2]; 
-      }
-      iswap++;
-    }
-  }
-
-
-  for(i = 0; i < 3; i++) {
-    for(iswap = 0; iswap < opt_maxswap; iswap++) {
-      if(myloc[i] + swap_direct[iswap][i] < 0) {
-        opt_pbc_flag[iswap] = 1;
-        opt_pbc[iswap][i]   = 1;
-        opt_slablo[iswap][i] = neigh_sublo[opt_sendproc[iswap]][i] - cut - domain->prd[i];
-        opt_slabhi[iswap][i] = neigh_subhi[opt_sendproc[iswap]][i] + cut - domain->prd[i];
-      }
-      else if(myloc[i] + swap_direct[iswap][i] >= procgrid[i]) {
-        opt_pbc_flag[iswap] = 1;
-        opt_pbc[iswap][i]   = -1;
-        opt_slablo[iswap][i] = neigh_sublo[opt_sendproc[iswap]][i] - cut + domain->prd[i];
-        opt_slabhi[iswap][i] = neigh_subhi[opt_sendproc[iswap]][i] + cut + domain->prd[i];
-      } else {
-        opt_slablo[iswap][i] = neigh_sublo[opt_sendproc[iswap]][i] - cut;
-        opt_slabhi[iswap][i] = neigh_subhi[opt_sendproc[iswap]][i] + cut;
-      }
-    }
-  }
-
-
-
-  for(int i = 0; i < 3; i++){
-    double tmp_cut = cut;
-    if(tmp_cut > domain->lcl_prd[i]) tmp_cut -= domain->lcl_prd[i];
-
-    bin_split_line[i][0] = sublo[i] + tmp_cut;
-    bin_split_line[i][1] = subhi[i] - tmp_cut;
-    if(bin_split_line[i][0] > bin_split_line[i][1]) {
-      std::swap(bin_split_line[i][0], bin_split_line[i][1]);
-    }
-
-    // if(DEBUG_MSG){
-    //   utils::logmesg(lmp,"bin_split_line {:.3f}:{:.3f} subbox {:.3f}:{:.3f}  cut {} {} prd {}\n", 
-    //       bin_split_line[i][0], bin_split_line[i][1], sublo[i], subhi[i], tmp_cut, cut, domain->lcl_prd[i]);
-    // }
-  }
-
-  double binsublo[27][3], binsubhi[27][3];
-
-  for(int ibin = 0; ibin < 27; ibin++) {
-    int ss[3];
-    ss[2] = ibin / 9;
-    ss[1] = (ibin / 3) % 3;
-    ss[0] = ibin % 3;
-    for(int i = 0; i < 3; i++) {
-      if(ss[i] == 0) {
-        binsublo[ibin][i] = sublo[i];
-        binsubhi[ibin][i] = bin_split_line[i][0];
-      } else if(ss[i] == 1){
-        binsublo[ibin][i] = bin_split_line[i][0];
-        binsubhi[ibin][i] = bin_split_line[i][1];
-      } else if(ss[i] == 2) {
-        binsublo[ibin][i] = bin_split_line[i][1];
-        binsubhi[ibin][i] = subhi[i];
-      }
-    }
-  }
-
-
-  // if(DEBUG_MSG){
-  //   for(int ibin = 0; ibin < 27; ibin++) {
-  //     utils::logmesg(lmp,"ibin {} ibinborder {:.3f}:{:.3f}  {:.3f}:{:.3f}  {:.3f}:{:.3f}\n", 
-  //                   ibin,
-  //                   binsublo[ibin][0], binsubhi[ibin][0],
-  //                   binsublo[ibin][1], binsubhi[ibin][1],
-  //                   binsublo[ibin][2], binsubhi[ibin][2]                
-  //                   );
-  //   }
-  // }
-
-  for(int ibin = 0; ibin < 27; ibin++) {
-    bin2swap_ptr[ibin] = 0;
-  }
-
-  for(int ibin = 0; ibin < 27; ibin++) {
-    bin2swap_ptr[ibin] = 0;
-    for(int iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
-      if(isEqualSmaller(opt_slablo[iswap][0], binsublo[ibin][0]) && isEqualBigger(opt_slabhi[iswap][0], binsubhi[ibin][0]) &&
-          isEqualSmaller(opt_slablo[iswap][1], binsublo[ibin][1]) && isEqualBigger(opt_slabhi[iswap][1], binsubhi[ibin][1]) &&
-          isEqualSmaller(opt_slablo[iswap][2], binsublo[ibin][2]) && isEqualBigger(opt_slabhi[iswap][2], binsubhi[ibin][2]) ) {
-        bin2swap[ibin][bin2swap_ptr[ibin]++] = iswap;
-      }
-    }
-  }
-
-  if(DEBUG_MSG){
-    for(int ibin = 0; ibin < 27; ibin++) {
-      utils::logmesg(lmp," ibin {} coord {} {} {}, has {} swap", ibin, ibin % 3, (ibin / 3) % 3, ibin /9, bin2swap_ptr[ibin]);
-      for(int i = 0; i < bin2swap_ptr[ibin]; i++) {
-        utils::logmesg(lmp," {} ", bin2swap[ibin][i]);
-      }
-      utils::logmesg(lmp," \n");
-    }
-  }
-
-  iswap = 0;
-  
+ 
   for (dim = 0; dim < 3; dim++) {
     for (ineed = 0; ineed < 2*maxneed[dim]; ineed++) {
       pbc_flag[iswap] = 0;
@@ -855,11 +871,236 @@ void CommBrick::setup()
     }
   }
 
-  if(DEBUG_MSG && !first_init_flag) {
-    utils::logmesg(lmp," my_loc {} {} {} \n", myloc[0],myloc[1],myloc[2]);
+  setup_opt();
 
+  if(comm->numa_flag)
+    setup_numa();
+
+}
+
+void CommBrick::setup_opt() {
+  // cutghost[] = max distance at which ghost atoms need to be acquired
+  // for orthogonal:
+  //   cutghost is in box coords = neigh->cutghost in all 3 dims
+  // for triclinic:
+  //   neigh->cutghost = distance between tilted planes in box coords
+  //   cutghost is in lamda coords = distance between those planes
+  // for multi:
+  //   cutghostmulti = same as cutghost, only for each atom collection
+  // for multi/old:
+  //   cutghostmultiold = same as cutghost, only for each atom type
+
+  int i,j,dim;
+  int ntypes = atom->ntypes;
+  double *prd,*sublo,*subhi, *nusublo,*nusubhi;
+  double cutneighmaxsq;
+
+  double cut = get_comm_cutoff();
+
+  bit_nid = 1 << numa_id;
+
+  ndims = 0;
+
+  prd = domain->prd;
+  sublo = domain->sublo;
+  subhi = domain->subhi;
+  cutghost[0] = cutghost[1] = cutghost[2] = cut;
+ 
+  cutneighmaxsq = neighbor->cutneighmaxsq;
+
+  memory->create(neigh_sublo,nprocs,3,"comm:neigh_sublo");
+  memory->create(neigh_subhi,nprocs,3,"comm:neigh_subhi");
+
+  MPI_Allgather(domain->sublo,3,MPI_DOUBLE,neigh_sublo[0],3,MPI_DOUBLE,world);
+  MPI_Allgather(domain->subhi,3,MPI_DOUBLE,neigh_subhi[0],3,MPI_DOUBLE,world);
+
+  for(i = 0; i < DIM_NUM; i++){
+    if(box_distance(con_direction[i], domain->lcl_prd) < cutneighmaxsq) {
+      directions[ndims][0] = con_direction[i][0];
+      directions[ndims][1] = con_direction[i][1];
+      directions[ndims][2] = con_direction[i][2];
+      ndims++;
+    }
+  }
+
+  memory->create(opt_procneigh,   ndims,  2,  "comm:opt_procneigh");
+
+  init_buffers_opt();
+
+  if(me == 0) utils::logmesg(lmp,"[info] setup ndims   {} opt_maxswap   {}\n", ndims, opt_maxswap);
+
+  int ncoords[3]; 
+  for(dim = 0; dim < ndims; dim++) {
+    for(int i = 0; i < 2; i++) {
+      for(int j = 0; j < 3; j++) {
+        if(i%2 == 0)
+          ncoords[j] = myloc[j] - directions[dim][j];
+        else
+          ncoords[j] = myloc[j] + directions[dim][j];
+        
+        if(ncoords[j] < 0) ncoords[j] += procgrid[j];
+        if(ncoords[j] >= procgrid[j]) ncoords[j] -= procgrid[j];
+      }
+      opt_procneigh[dim][i] = grid2proc[ncoords[0]][ncoords[1]][ncoords[2]];
+    }
+  }
+  if(DEBUG_MSG){
+    auto mesg = fmt::format("[info] opt_procneigh :"); 
+    for(dim = 0; dim < ndims; dim++) {
+      mesg += fmt::format("{} {}, ", opt_procneigh[dim][0],opt_procneigh[dim][1]); 
+    }
+    utils::logmesg(lmp,"{}\n", mesg);
+  }
+    
+  if ((cut == 0.0) && (me == 0))
+    error->warning(FLERR,"Communication cutoff is 0.0. No ghost atoms "
+                   "will be generated. Atoms may get lost.");
+
+  int *periodicity = domain->periodicity;
+  int left,right;
+
+  int ineed, iswap;
+
+  iswap = 0;
+
+  for(dim = 0; dim < ndims; dim++) {
+    for(ineed = 0; ineed < 2; ineed++) {
+      opt_pbc_flag[iswap] = 0;
+      opt_pbc[iswap][0] = opt_pbc[iswap][1] = opt_pbc[iswap][2] =
+        opt_pbc[iswap][3] = opt_pbc[iswap][4] = opt_pbc[iswap][5] = 0;
+
+      if(ineed %2 == 0) {
+        opt_sendproc[iswap] = opt_procneigh[dim][0];
+        opt_recvproc[iswap] = opt_procneigh[dim][1];
+        swap_direct[iswap][0] = -directions[dim][0]; 
+        swap_direct[iswap][1] = -directions[dim][1]; 
+        swap_direct[iswap][2] = -directions[dim][2]; 
+      } else {
+        opt_sendproc[iswap] = opt_procneigh[dim][1];
+        opt_recvproc[iswap] = opt_procneigh[dim][0];
+        swap_direct[iswap][0] = directions[dim][0]; 
+        swap_direct[iswap][1] = directions[dim][1]; 
+        swap_direct[iswap][2] = directions[dim][2]; 
+      }
+      iswap++;
+    }
+  }
+  
+  for(i = 0; i < 3; i++) {
+    for(iswap = 0; iswap < opt_maxswap; iswap++) {
+      if(myloc[i] + swap_direct[iswap][i] < 0) {
+        opt_pbc_flag[iswap] = 1;
+        opt_pbc[iswap][i]   = 1;
+        opt_slablo[iswap][i] = neigh_sublo[opt_sendproc[iswap]][i] - cut - domain->prd[i];
+        opt_slabhi[iswap][i] = neigh_subhi[opt_sendproc[iswap]][i] + cut - domain->prd[i];
+      }
+      else if(myloc[i] + swap_direct[iswap][i] >= procgrid[i]) {
+        opt_pbc_flag[iswap] = 1;
+        opt_pbc[iswap][i]   = -1;
+        opt_slablo[iswap][i] = neigh_sublo[opt_sendproc[iswap]][i] - cut + domain->prd[i];
+        opt_slabhi[iswap][i] = neigh_subhi[opt_sendproc[iswap]][i] + cut + domain->prd[i];
+      } else {
+        opt_slablo[iswap][i] = neigh_sublo[opt_sendproc[iswap]][i] - cut;
+        opt_slabhi[iswap][i] = neigh_subhi[opt_sendproc[iswap]][i] + cut;
+      }
+    }
+  }
+
+  for(int iswap = 0; iswap < opt_maxswap; iswap++) {
+    int rswap = iswap % 2 == 0 ? iswap + 1 : iswap - 1;
+    opt_pbc_flag_recv[iswap] = opt_pbc_flag[rswap];
+    opt_pbc_recv[iswap][0] = -1 * opt_pbc[rswap][0];
+    opt_pbc_recv[iswap][1] = -1 * opt_pbc[rswap][1];
+    opt_pbc_recv[iswap][2] = -1 * opt_pbc[rswap][2];
+  }
+
+  for(int i = 0; i < 3; i++){
+    double tmp_cut = cut;
+    if(tmp_cut > domain->lcl_prd[i]) tmp_cut -= domain->lcl_prd[i];
+
+    bin_split_line[i][0] = sublo[i] + tmp_cut;
+    bin_split_line[i][1] = subhi[i] - tmp_cut;
+    if(bin_split_line[i][0] > bin_split_line[i][1]) {
+      std::swap(bin_split_line[i][0], bin_split_line[i][1]);
+    }
+
+    // if(DEBUG_MSG){
+    //   utils::logmesg(lmp,"bin_split_line {:.3f}:{:.3f} subbox {:.3f}:{:.3f}  cut {} {} prd {}\n", 
+    //       bin_split_line[i][0], bin_split_line[i][1], sublo[i], subhi[i], tmp_cut, cut, domain->lcl_prd[i]);
+    // }
+  }
+
+  double binsublo[27][3], binsubhi[27][3];
+
+  for(int ibin = 0; ibin < 27; ibin++) {
+    int ss[3];
+    ss[2] = ibin / 9;
+    ss[1] = (ibin / 3) % 3;
+    ss[0] = ibin % 3;
+    for(int i = 0; i < 3; i++) {
+      if(ss[i] == 0) {
+        binsublo[ibin][i] = sublo[i];
+        binsubhi[ibin][i] = bin_split_line[i][0];
+      } else if(ss[i] == 1){
+        binsublo[ibin][i] = bin_split_line[i][0];
+        binsubhi[ibin][i] = bin_split_line[i][1];
+      } else if(ss[i] == 2) {
+        binsublo[ibin][i] = bin_split_line[i][1];
+        binsubhi[ibin][i] = subhi[i];
+      }
+    }
+  }
+
+  comm_step = full_flag ? 1 : 2;
+
+  if(me == 0) utils::logmesg(lmp,"[info] comm_step  {}  full_flag {} \n", comm_step, full_flag);
+
+  for(int tid = 0; tid < COMM_TNUM; tid++) {
+    for(int i = tid * 2 ; i < opt_maxswap; i += TNI_NUM * 2) {
+      for(int iswap = i; iswap <= i+1; iswap += comm_step) {
+        opt_swap[tid].push_back(iswap);
+      }
+    }
+  }
+
+  if(DEBUG_MSG){
+    for(int tid = 0; tid < COMM_TNUM; tid++) {
+      utils::logmesg(lmp,"[INFO] opt_swap tid {} : ", tid);
+      for(const auto iswap:opt_swap[tid]) {
+        utils::logmesg(lmp," {} ", iswap);
+      }
+      utils::logmesg(lmp," \n");
+    }
+  }
+  
+  for(int ibin = 0; ibin < 27; ibin++) {
+    bin2swap_ptr[ibin] = 0;
+    for(int iswap = 0; iswap < opt_maxswap; iswap+=comm_step) {
+      if(isEqualSmaller(opt_slablo[iswap][0], binsublo[ibin][0]) && isEqualBigger(opt_slabhi[iswap][0], binsubhi[ibin][0]) &&
+          isEqualSmaller(opt_slablo[iswap][1], binsublo[ibin][1]) && isEqualBigger(opt_slabhi[iswap][1], binsubhi[ibin][1]) &&
+          isEqualSmaller(opt_slablo[iswap][2], binsublo[ibin][2]) && isEqualBigger(opt_slabhi[iswap][2], binsubhi[ibin][2]) ) {
+        bin2swap[ibin][bin2swap_ptr[ibin]++] = iswap;
+      }
+    }
+  }
+
+
+  if(DEBUG_MSG){
+    for(int ibin = 0; ibin < 27; ibin++) {
+      utils::logmesg(lmp," ibin {} coord {} {} {}, has {} swap", ibin, ibin % 3, (ibin / 3) % 3, ibin /9, bin2swap_ptr[ibin]);
+      for(int i = 0; i < bin2swap_ptr[ibin]; i++) {
+        utils::logmesg(lmp," {} ", bin2swap[ibin][i]);
+      }
+      utils::logmesg(lmp," \n");
+    }
+  }
+
+  iswap = 0;
+
+  if(DEBUG_MSG) {
+    utils::logmesg(lmp," my_loc {} {} {} \n", myloc[0],myloc[1],myloc[2]);
     for(i = 0; i < opt_maxswap; i++) {
-      utils::logmesg(lmp,"iswap {} sendproc {} recvproc {}  sendborder {:.3f}:{:.3f}  {:.3f}:{:.3f}  {:.3f}:{:.3f},      sendborder_sla {:.3f}:{:.3f}  {:.3f}:{:.3f} {:.3f}:{:.3f}\n", 
+      utils::logmesg(lmp,"[info] iswap {} sendproc {} recvproc {}  sendborder {:.3f}:{:.3f}  {:.3f}:{:.3f}  {:.3f}:{:.3f},      sendborder_sla {:.3f}:{:.3f}  {:.3f}:{:.3f} {:.3f}:{:.3f}\n", 
                     i, opt_sendproc[i], opt_recvproc[i],
                     neigh_sublo[opt_sendproc[i]][0], neigh_subhi[opt_sendproc[i]][0],
                     neigh_sublo[opt_sendproc[i]][1], neigh_subhi[opt_sendproc[i]][1],
@@ -872,9 +1113,613 @@ void CommBrick::setup()
   }
 
   first_init_flag = true;
-
 }
 
+void CommBrick::setup_numa() {
+  int i,j,dim;
+  int ntypes = atom->ntypes;
+  double *prd, *nusublo,*nusubhi;
+  double cutneighmaxsq;
+  int ***nugrid2proc;
+
+  double cut = get_comm_cutoff();
+
+  nundims = 0;
+
+  prd = domain->prd;
+  cutghost[0] = cutghost[1] = cutghost[2] = cut;
+
+  FJMPI_Topology_get_shape(&nuprocgrid[0], &nuprocgrid[1], &nuprocgrid[2]);
+
+  if(DEBUG_MSG ) utils::logmesg(lmp,"[NUMA] nuprocgrid    {} {} {} \n", nuprocgrid[0], nuprocgrid[1], nuprocgrid[2]);
+  if(DEBUG_MSG ) utils::logmesg(lmp,"[NUMA] procgrid      {} {} {} \n", procgrid[0], procgrid[1], procgrid[2]);
+
+  int **gridi;
+  memory->create(gridi,nprocs,3, "gridi");
+  memory->create(nugrid2proc, procgrid[0], procgrid[1],procgrid[2], "nugrid2proc");
+
+  FJMPI_Topology_get_coords(world, me, FJMPI_LOGICAL, 3, numyloc);
+
+  MPI_Allgather(numyloc,3,MPI_INT,gridi[0],3,MPI_INT,world);
+
+  for (int i = 0; i < nprocs; i++)
+    nugrid2proc[gridi[i][0]][gridi[i][1]][gridi[i][2]] = i / NUMA_NUM;
+
+  memory->destroy(gridi);
+  
+  nusublo = domain->nusublo;
+  nusubhi = domain->nusubhi;
+  
+  cutneighmaxsq = neighbor->cutneighmaxsq;
+
+  memory->create(neigh_nusublo,nprocs,3,"comm:nuneigh_sublo");
+  memory->create(neigh_nusubhi,nprocs,3,"comm:nuneigh_subhi");
+
+  MPI_Allgather(domain->nusublo,3,MPI_DOUBLE,neigh_nusublo[0],3,MPI_DOUBLE,world);
+  MPI_Allgather(domain->nusubhi,3,MPI_DOUBLE,neigh_nusubhi[0],3,MPI_DOUBLE,world);
+
+  // if(DEBUG_MSG){
+  //   auto mesg = fmt::format("[NUMA] neigh_nusub \n"); 
+  //   for(i = 0; i < nprocs; i++) {
+  //     mesg += fmt::format(" rankid {}  {:.3f}:{:.3f}, {:.3f}:{:.3f}, {:.3f}:{:.3f} \n", i, 
+  //                 neigh_nusublo[i][0],neigh_nusubhi[i][0], neigh_nusublo[i][1],neigh_nusubhi[i][1],neigh_nusublo[i][2],neigh_nusubhi[i][2]); 
+  //   }
+  //   utils::logmesg(lmp,"{} \n", mesg);
+  // }
+
+  for(i = 0; i < DIM_NUM; i++){
+    if(box_distance(con_direction[i], domain->lcl_nuprd) < cutneighmaxsq) {
+      directions[nundims][0] = con_direction[i][0];
+      directions[nundims][1] = con_direction[i][1];
+      directions[nundims][2] = con_direction[i][2];
+      nundims++;
+    }
+  }
+
+  memory->create(numa_procneigh, nundims, 2,  "comm:numa_procneigh");
+
+  init_buffers_numa();
+
+  if(me == 0) utils::logmesg(lmp,"[NUMA] setup nundims {} nuopt_maxswap {}\n", nundims, numa_maxswap);
+
+  int ncoords[3]; 
+
+  for(dim = 0; dim < nundims; dim++) {
+    for(int i = 0; i < 2; i++) {
+      for(int j = 0; j < 3; j++) {
+        if(i%2 == 0)
+          ncoords[j] = numyloc[j] - directions[dim][j];
+        else
+          ncoords[j] = numyloc[j] + directions[dim][j];
+        
+        if(ncoords[j] < 0) ncoords[j] += nuprocgrid[j];
+        if(ncoords[j] >= nuprocgrid[j]) ncoords[j] -= nuprocgrid[j];
+      }
+      numa_procneigh[dim][i] = nugrid2proc[ncoords[0]][ncoords[1]][ncoords[2]];
+      numa_procneigh[dim][i] = numa_procneigh[dim][i] * 4 + numa_id;
+    }
+  }
+
+  // if(DEBUG_MSG) {
+  //   auto mesg = fmt::format("[NUMA] numa_procneigh nundims {}:\n", nundims); 
+  //   for(dim = 0; dim < nundims; dim++) {
+  //     mesg += fmt::format("     dim {} proceneighbor {} {} \n", dim, numa_procneigh[dim][0],numa_procneigh[dim][1]); 
+  //   }
+  //   utils::logmesg(lmp,"{} \n", mesg);
+  // }
+
+  int ineed, iswap;
+
+  iswap = 0;
+
+  for(dim = 0; dim < nundims; dim++) {
+    for(ineed = 0; ineed < 2; ineed++) {
+      numa_pbc_flag[iswap] = 0;
+      numa_pbc[iswap][0] = numa_pbc[iswap][1] = numa_pbc[iswap][2] =
+        numa_pbc[iswap][3] = numa_pbc[iswap][4] = numa_pbc[iswap][5] = 0;
+      if(ineed %2 == 0){
+        numa_sendproc[iswap] = numa_procneigh[dim][0];
+        numa_recvproc[iswap] = numa_procneigh[dim][1];
+        swap_nudirect[iswap][0] = -directions[dim][0]; 
+        swap_nudirect[iswap][1] = -directions[dim][1];
+        swap_nudirect[iswap][2] = -directions[dim][2];
+      } else{
+        numa_sendproc[iswap] = numa_procneigh[dim][1];
+        numa_recvproc[iswap] = numa_procneigh[dim][0];
+        swap_nudirect[iswap][0] = directions[dim][0]; 
+        swap_nudirect[iswap][1] = directions[dim][1]; 
+        swap_nudirect[iswap][2] = directions[dim][2]; 
+      }
+      iswap++;
+    }
+  }
+
+  
+  // if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish create numa_sendproc numa_recvproc\n");
+
+  for(i = 0; i < 3; i++) {
+    for(iswap = 0; iswap < numa_maxswap; iswap++) {
+      if(numyloc[i] + swap_nudirect[iswap][i] < 0) {
+        numa_pbc_flag[iswap] = 1;
+        numa_pbc[iswap][i]   = 1;
+        numa_slablo[iswap][i] = neigh_nusublo[numa_sendproc[iswap]][i] - cut - domain->prd[i];
+        numa_slabhi[iswap][i] = neigh_nusubhi[numa_sendproc[iswap]][i] + cut - domain->prd[i];
+      }
+      else if(numyloc[i] + swap_nudirect[iswap][i] >= nuprocgrid[i]) {
+        numa_pbc_flag[iswap] = 1;
+        numa_pbc[iswap][i]   = -1;
+        numa_slablo[iswap][i] = neigh_nusublo[numa_sendproc[iswap]][i] - cut + domain->prd[i];
+        numa_slabhi[iswap][i] = neigh_nusubhi[numa_sendproc[iswap]][i] + cut + domain->prd[i];
+      } else {
+        numa_slablo[iswap][i] = neigh_nusublo[numa_sendproc[iswap]][i] - cut;
+        numa_slabhi[iswap][i] = neigh_nusubhi[numa_sendproc[iswap]][i] + cut;
+      }
+    }
+  }
+
+  for(int iswap = 0; iswap < numa_maxswap; iswap++) {
+    int rswap = iswap % 2 == 0 ? iswap + 1 : iswap - 1;
+    numa_pbc_flag_recv[iswap] = numa_pbc_flag[rswap];
+    numa_pbc_recv[iswap][0] = -1 * numa_pbc[rswap][0];
+    numa_pbc_recv[iswap][1] = -1 * numa_pbc[rswap][1];
+    numa_pbc_recv[iswap][2] = -1 * numa_pbc[rswap][2];
+  }
+
+  if(DEBUG_MSG) {
+    auto mesg = fmt::format("[NUMA] numa_procneigh numa_maxswap {} me {} :\n", numa_maxswap, me); 
+    for(iswap = 0; iswap < numa_maxswap; iswap++) {
+      mesg += fmt::format("[NUMA] iswap {} sendproc {} recvproc {} pbc {} {} {} {} \n ", iswap, numa_sendproc[iswap],numa_recvproc[iswap],
+      numa_pbc_flag[iswap], numa_pbc[iswap][0],numa_pbc[iswap][1],numa_pbc[iswap][2]); 
+    }
+    utils::logmesg(lmp,"{} \n", mesg);
+  }
+
+  // for(int i = 0; i < 3; i++){
+  //   double tmp_cut = cut;
+  //   if(tmp_cut > domain->lcl_nuprd[i]) tmp_cut -= domain->lcl_nuprd[i];
+
+  //   nubin_split_line[i][0] = nusublo[i] + tmp_cut;
+  //   nubin_split_line[i][1] = nusubhi[i] - tmp_cut;
+  //   if(nubin_split_line[i][0] > nubin_split_line[i][1]) {
+  //     std::swap(nubin_split_line[i][0], nubin_split_line[i][1]);
+  //   }
+
+    // if(DEBUG_MSG){
+    //   utils::logmesg(lmp,"nubin_split_line {:.3f}:{:.3f} subbox {:.3f}:{:.3f}  cut {} {} prd {}\n", 
+    //       nubin_split_line[i][0], nubin_split_line[i][1], nusublo[i], nusubhi[i], tmp_cut, cut, domain->lcl_nuprd[i]);
+    // }
+  // }
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish numa splitline\n");
+
+  // double nubinsublo[27][3], nubinsubhi[27][3];
+
+  // for(int ibin = 0; ibin < 27; ibin++) {
+  //   int ss[3];
+  //   ss[2] = ibin / 9;
+  //   ss[1] = (ibin / 3) % 3;
+  //   ss[0] = ibin % 3;
+  //   for(int i = 0; i < 3; i++) {
+  //     if(ss[i] == 0) {
+  //       nubinsublo[ibin][i] = nusublo[i];
+  //       nubinsubhi[ibin][i] = nubin_split_line[i][0];
+  //     } else if(ss[i] == 1){
+  //       nubinsublo[ibin][i] = nubin_split_line[i][0];
+  //       nubinsubhi[ibin][i] = nubin_split_line[i][1];
+  //     } else if(ss[i] == 2) {
+  //       nubinsublo[ibin][i] = nubin_split_line[i][1];
+  //       nubinsubhi[ibin][i] = nusubhi[i];
+  //     }
+  //   }
+  // }
+
+  // for(int ibin = 0; ibin < 27; ibin++) {
+  //   nubin2swap_ptr[ibin] = 0;
+  //   for(int iswap = 0; iswap < numa_maxswap; iswap+=COMM_STEP) {
+  //     if(isEqualSmaller(numa_slablo[iswap][0], nubinsublo[ibin][0]) && isEqualBigger(numa_slabhi[iswap][0], nubinsubhi[ibin][0]) &&
+  //         isEqualSmaller(numa_slablo[iswap][1], nubinsublo[ibin][1]) && isEqualBigger(numa_slabhi[iswap][1], nubinsubhi[ibin][1]) &&
+  //         isEqualSmaller(numa_slablo[iswap][2], nubinsublo[ibin][2]) && isEqualBigger(numa_slabhi[iswap][2], nubinsubhi[ibin][2]) ) {
+  //       nubin2swap[ibin][nubin2swap_ptr[ibin]++] = iswap;
+  //     }
+  //   }
+  // }
+
+  if(DEBUG_MSG) utils::logmesg(lmp," [NUMA] finish create numa ibin\n");
+
+  thr_maxswap = (numa_maxswap / NUMA_NUM) ;
+  if((numa_maxswap) % NUMA_NUM > numa_id) thr_maxswap++; 
+
+  thr_maxswap = MIN(COMM_TNUM, thr_maxswap);
+    
+  int nid = 0;
+  for(int i = 0, nid = 0; i < numa_maxswap; i+=2) {
+    numa_swap_all[nid].push_back(i);
+    numa_swap_all[nid].push_back(i + 1);
+
+    numa_swap_full_all[nid].push_back(i);
+    numa_swap_full_all[nid].push_back(i+1);
+    nid = (nid + 1) % NUMA_NUM;
+  }
+
+  numa_swap = numa_swap_all[numa_id];
+  numa_swap_full = numa_swap_full_all[numa_id];
+
+  int tid = 0;
+  for(i = 0; i < numa_swap.size(); i++) {
+    thr_swap[tid].push_back(numa_swap[i]);
+    if(i % 2 == 1) {
+      tid = (tid + 1) % thr_maxswap;
+    }
+  }
+
+  tid = 0;
+  for(i = 0; i < numa_swap_full.size(); i+=2) {
+    thr_swap_full[tid].push_back(numa_swap_full[i]);
+    thr_swap_full[tid].push_back(numa_swap_full[i+1]);
+    tid = (tid + 1) % thr_maxswap;
+  }
+  // int tid = 0;
+  // for(i = 0; i < numa_swap.size(); i++) {
+  //   thr_swap[tid].push_back(numa_swap[i]);
+  //   // if(i % 2 == 1) {
+  //     tid = (tid + 1) % thr_maxswap;
+  //   // }
+  // }
+
+  // tid = 0;
+  // for(i = 0; i < numa_swap_full.size(); i+=1) {
+  //   thr_swap_full[tid].push_back(numa_swap_full[i]);
+  //   // thr_swap_full[tid].push_back(numa_swap_full[i+1]);
+  //   tid = (tid + 1) % thr_maxswap;
+  // }
+
+  for(int iswap = 0; iswap < numa_maxswap; iswap++) {
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      for(auto _i : numa_swap_full_all[nu]) {
+        if(iswap == _i) swap2numa_swap[iswap] = nu;
+      }
+    }
+  }
+
+  if(DEBUG_MSG) {
+    for(int nid = 0; nid < NUMA_NUM; nid++)
+      utils::logmesg_arry(lmp, fmt::format("[NUMA] numa_swap_all: numa_swap.size {} thr_maxswap {} ", numa_swap.size(), thr_maxswap), numa_swap_all[nid].data(), numa_swap_all[nid].size(), 1); 
+    for(int tid = 0; tid < thr_maxswap; tid++) 
+      utils::logmesg_arry(lmp, fmt::format("[NUMA] thr_swap tid {} ", tid), thr_swap[tid].data(), thr_swap[tid].size(), 1); 
+    for(int nid = 0; nid < NUMA_NUM; nid++) 
+      utils::logmesg_arry(lmp, fmt::format("[NUMA] numa_swap_all:  ", numa_swap_full.size()), numa_swap_full_all[nid].data(), numa_swap_full_all[nid].size(), 1); 
+    for(int tid = 0; tid < thr_maxswap; tid++) 
+      utils::logmesg_arry(lmp, fmt::format("[NUMA] thr_swap_full tid {} ", tid), thr_swap_full[tid].data(), thr_swap_full[tid].size(), 1); 
+
+    utils::logmesg_arry(lmp, fmt::format("[NUMA] swap2numa_swap "), swap2numa_swap,numa_maxswap, 1); 
+  }
+ 
+  if(DEBUG_MSG) utils::logmesg(lmp," [NUMA] finish setup numa\n");
+
+
+
+  first_init_flag = true;
+  
+}
+
+void CommBrick::setup_init_shdmem_region() {
+
+  // memory->create(opt_recvnum, opt_maxswap,"comm:opt_recvnum");
+
+  // all_recv_buffer = (double *) memory->smalloc(total_buffer_size*sizeof(double),"comm:all_recv_buffer");
+
+  // uintptr_t cur_offset = 0;
+  // for(int i = 0; i < VCQ_NUM; i++) {      
+  //   for(int j = 0; j < opt_maxswap; j++) {
+  //     opt_buf_send[i][j] = all_recv_buffer + cur_offset; opt_stadd_send_offset[i][j] = cur_offset * sizeof(double); cur_offset += opt_maxsend[j];
+  //     opt_buf_recv[i][j] = all_recv_buffer + cur_offset; opt_stadd_recv_offset[i][j] = cur_offset * sizeof(double); cur_offset += opt_maxrecv[j];
+  //   }
+  // }
+
+  // for(int ii = 0; ii < opt_maxswap; ii++) {
+  //   shm_len += sizeof(double) * opt_maxsend[ii];
+  // }
+  // shm_len *= VCQ_NUM * 2;
+  int pagesize = sysconf(_SC_PAGESIZE);
+
+  shm_len = 0;
+  shm_len += total_buffer_size * sizeof(double) * 2 + pagesize;
+  shm_len += sizeof(std::atomic<uint64_t>) * 4 * T_THREAD + 
+                        sizeof(std::bitset<BIT_SET_DEEPTH>) * 2 +
+                        sizeof(uint64_t) * atom->nmax * 4 * 2 + 
+                        sizeof(double) * atom->nmax * 3 * (2 + nthreads) * 2 +
+                        sizeof(double) * SHARE_DATA_LENGTH + 
+                        sizeof(uintptr_t) * 2048;
+
+  
+  init_shdmem(numa_id, keys[numa_id], shmids[numa_id], shm_data[numa_id], shm_len, VFILE_0, numa_id+1);
+
+  if(DEBUG_MSG || me == 0) utils::logmesg(lmp,"[NUMA] begin init_shdmem numa_id {} addr {} to {} buffersize {} nmax {} cacheline_size {}\n",
+              numa_id, (void *)shm_data[numa_id], (void *)((uintptr_t)shm_data[numa_id] + shm_len), shm_len, atom->nmax, sysconf(_SC_LEVEL1_ICACHE_LINESIZE));
+
+  uintptr_t shm_bias = (uintptr_t)shm_data[numa_id];
+
+  for(int i = 0; i < T_THREAD; i++) { a_written[i]    = (std::atomic<int>*)shm_bias;       shm_bias = align_cache_size(shm_bias, sizeof(std::atomic<int>));}
+  for(int i = 0; i < T_THREAD; i++) { a_written_s0[i] = (std::atomic<uint64_t>*)shm_bias;       shm_bias = align_cache_size(shm_bias, sizeof(std::atomic<uint64_t>));}
+  for(int i = 0; i < T_THREAD; i++) { a_written_tt[i] = (std::atomic<int>*)shm_bias;       shm_bias = align_cache_size(shm_bias, sizeof(std::atomic<int>));}
+  for(int i = 0; i < RPROC;    i++) { a_written_reverse[i] = (std::atomic<int>*)shm_bias;  shm_bias = align_cache_size(shm_bias, sizeof(std::atomic<int>));}
+
+  // atom_bit_share    = (void*)shm_bias;   shm_bias = align_cache_size(shm_bias, sizeof(std::bitset<BIT_SET_DEEPTH>));
+  // atom_bit          = (void*)shm_bias;   shm_bias = align_cache_size(shm_bias, sizeof(std::bitset<BIT_SET_DEEPTH>));
+
+  // std::bitset<BIT_SET_DEEPTH> _bit_set0, _bit_set1;
+  // memcpy(atom_bit_share, &_bit_set0, sizeof(std::bitset<BIT_SET_DEEPTH>));
+  // memcpy(atom_bit      , &_bit_set1, sizeof(std::bitset<BIT_SET_DEEPTH>));
+
+  // *(std::bitset<BIT_SET_DEEPTH>*)atom_bit_share = 0;
+  // *(std::bitset<BIT_SET_DEEPTH>*)atom_bit       = 0;
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish atomic assignment {}\n", (void*)shm_bias);
+
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry(lmp, fmt::format("[NUMA] before atom->tag "), atom->tag, atom->nlocal, 1); 
+  //   utils::logmesg_arry(lmp, fmt::format("[NUMA] before atom->type "), atom->type, atom->nlocal, 1); 
+  //   utils::logmesg_arry(lmp, fmt::format("[NUMA] before atom->mask "), atom->mask, atom->nlocal, 1); 
+  //   utils::logmesg_arry(lmp, fmt::format("[NUMA] before atom->image "), atom->image, atom->nlocal, 1); 
+  // }
+
+  memcpy((void*)shm_bias, atom->tag,   sizeof(tagint) *  atom->nmax);   memory->destroy(atom->tag);
+  atom->tag    = (tagint*)shm_bias;    shm_bias = align_cache_size(shm_bias, sizeof(tagint) * atom->nmax);
+  memcpy((void*)shm_bias, atom->type,  sizeof(int) *    atom->nmax);    memory->destroy(atom->type);
+  atom->type   = (int*)shm_bias;       shm_bias = align_cache_size(shm_bias, sizeof(int) * atom->nmax);
+  memcpy((void*)shm_bias, atom->mask,  sizeof(int) *    atom->nmax);    memory->destroy(atom->mask);
+  atom->mask   = (int*)shm_bias;       shm_bias = align_cache_size(shm_bias,  sizeof(int) *    atom->nmax);
+  // memcpy((void*)shm_bias, atom->image, sizeof(imageint) * atom->nmax);   memory->destroy(atom->image);
+  // atom->image  = (imageint*)shm_bias;  shm_bias = align_cache_size(shm_bias, sizeof(imageint) * atom->nmax); 
+
+  // memcpy((void*)shm_bias, atom->v[0],   sizeof(double) *  atom->nmax * 3);   memory->destroy(atom->v);
+  // atom->v = new double*[atom->nmax];
+  // atom->v[0]  = (double*)shm_bias;    shm_bias = align_cache_size(shm_bias, sizeof(double) * atom->nmax * 3);
+
+  memcpy((void*)shm_bias, atom->x[0],   sizeof(double) *  atom->nmax * 3);   memory->destroy(atom->x);
+  atom->x = new double*[atom->nmax];
+  atom->x[0]  = (double*)shm_bias;    shm_bias = align_cache_size(shm_bias, sizeof(double) * atom->nmax * 3);
+
+  // memcpy((void*)shm_bias, atom->f[0],   sizeof(double) *  atom->nmax * 3 * nthreads);  memory->destroy(atom->f);
+  // atom->f = new double*[atom->nmax * nthreads];
+  // atom->f[0]  = (double*)shm_bias;    shm_bias = align_cache_size(shm_bias, sizeof(double) * atom->nmax * 3 * nthreads);
+
+  // for(int i = 1; i < atom->nmax; i++) {
+  //   atom->v[i] = atom->v[i-1] + 3;
+  // }
+  for(int i = 1; i < atom->nmax; i++) {
+    atom->x[i] = atom->x[i-1] + 3;
+  }
+
+  atom->avec->tag   =  atom->tag;
+  atom->avec->type  =  atom->type;
+  atom->avec->mask  =  atom->mask;
+  // atom->avec->image =  atom->image;
+  atom->avec->x =  atom->x;
+  // atom->avec->v =  atom->v;
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] sh_init x address {}\n", (void*)atom->x[0]);
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish atom v x f assignment {}\n", (uintptr_t)shm_bias);
+
+  shm_bias = ((shm_bias + pagesize - 1) / pagesize) * pagesize;
+
+  all_recv_buffer = (double *) shm_bias;  
+
+  // all_recv_buffer = (double *) memory->smalloc(total_buffer_size*sizeof(double),"comm:all_recv_buffer");
+
+  uintptr_t cur_offset = 0;
+  for(int i = 0; i < VCQ_NUM; i++) {
+    for(int j = 0; j < opt_maxswap; j++) {
+      opt_buf_send[i][j] = all_recv_buffer + cur_offset; opt_stadd_send_offset[i][j] = cur_offset * sizeof(double); cur_offset += opt_maxsend[0];
+      opt_buf_recv[i][j] = all_recv_buffer + cur_offset; opt_stadd_recv_offset[i][j] = cur_offset * sizeof(double); cur_offset += opt_maxsend[0];
+    }
+  }
+  shm_bias = align_cache_size(shm_bias, cur_offset * sizeof(double));
+  if(DEBUG_MSG || me == 0) utils::logmesg(lmp,"[NUMA] total_buffer_size {} cur_offset {} delta {} \n", total_buffer_size, cur_offset, total_buffer_size-cur_offset);
+  total_buffer_size = cur_offset;
+
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] opt_maxsend[0] {} \n", opt_maxsend[0]);
+
+  // if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[NUMA] opt_maxsend "), opt_maxsend, opt_maxswap, 1); 
+  // if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[NUMA] opt_maxrecv "), opt_maxrecv, opt_maxswap, 1); 
+
+  for(int i = 0; i < NUMA_NUM; i++) {
+    opt_force_recv[i] = new double*[numa_maxswap+1];
+    for(int j = 0; j < numa_maxswap+1; j++) {
+      opt_force_recv[i][j] = (double *) shm_bias; shm_bias = align_cache_size(shm_bias, opt_maxsend[0] * sizeof(double));
+      // if(DEBUG_MSG)  utils::logmesg(lmp,"[NUMA] opt_force_recv {} {} {} {} \n", i, j, opt_maxsend[0] * sizeof(double), (void*)opt_force_recv[i][j]);
+    }
+  }
+
+  // memory->create(opt_recvnum, opt_maxswap,"comm:opt_recvnum");
+  // memory->create(opt_sendnum, opt_maxswap,"comm:opt_sendnum");
+ 
+  opt_sendnum = (uint64_t*)shm_bias; shm_bias = align_cache_size(shm_bias, sizeof(uint64_t) * opt_maxswap);
+  opt_recvnum = (uint64_t*)shm_bias; shm_bias = align_cache_size(shm_bias, sizeof(uint64_t) * opt_maxswap);
+  shm_sendnum = (uint64_t*)shm_bias; shm_bias = align_cache_size(shm_bias, sizeof(uint64_t) * (opt_maxswap + 1));
+  shm_nlocal  = (uint64_t*)shm_bias; shm_bias = align_cache_size(shm_bias, sizeof(uint64_t) * 4);
+  shm_recvnum_numa    = (uint64_t*)shm_bias; shm_bias = align_cache_size(shm_bias, NUMA_NUM * sizeof(uint64_t) * opt_maxswap * NUMA_NUM + 1);
+  shm_firstrecv_numa  = (uint64_t*)shm_bias; shm_bias = align_cache_size(shm_bias, sizeof(uint64_t) * opt_maxswap * NUMA_NUM + 1);
+
+  for(int i = 0; i < NUMA_NUM; i++) {
+    shm_numa_recvnum_numa[i] = (uint64_t*)shm_bias;  shm_bias += sizeof(uint64_t) * numa_maxswap;
+  }
+  shm_bias = align_cache_size(shm_bias, 0);
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] shm_nlocal addr assignment addr {} offset {}\n", (void*)shm_nlocal, (uintptr_t)shm_nlocal-(uintptr_t)shm_data[numa_id]);
+
+  normal_data  = (double*)shm_bias;
+
+  intptr_t err =  (intptr_t)shm_data[numa_id] + (intptr_t)shm_len - (intptr_t)normal_data;
+  if(err < 0) error->one(FLERR, "shm data not enough {} normal_data addr {} end addr {}", err, (uintptr_t)normal_data, (uintptr_t)shm_data[numa_id] + shm_len);
+
+  if(DEBUG_MSG || me == 0) utils::logmesg(lmp,"[NUMA] finish normal_data assignment addr {} remind {}\n",
+                          (void*)normal_data, err);
+
+  std::atomic<uint64_t> tmp_a_written;
+  std::atomic<int> tmp_a_written_32;
+  for(int i = 0; i < T_THREAD; i++) {
+    memcpy(a_written_s0[i], &tmp_a_written, sizeof(std::atomic<uint64_t>));
+    *a_written_s0[i] = 0;
+    memcpy(a_written[i], &tmp_a_written_32, sizeof(std::atomic<int>));
+    *a_written[i] = 0;
+    memcpy(a_written_tt[i], &tmp_a_written_32, sizeof(std::atomic<int>));
+    *a_written_tt[i] = 0;
+  }
+
+  for(int i = 0; i < RPROC; i++) {
+    memcpy(a_written_reverse[i], &tmp_a_written_32, sizeof(std::atomic<int>));
+    *a_written_reverse[i] = 0;
+  }
+  // // int shm_ptr = 0;
+  // // std::string vpfile = "/vol0001/hp230257/lijianxiong/numa_aware_lammps/lammps/src/BIN_threadpool_lj/shm_map/test.";
+
+
+  if(me == 0) utils::logmesg(lmp,"[NUMA] finish init_shdmem \n");
+
+  MPI_Barrier(nuworld);
+}
+
+void CommBrick::numa_shm_init() {
+
+  setup_init_shdmem_region();
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish setup_init_shdmem_region\n");
+
+  for(int nu = 0; nu < NUMA_NUM; nu++) {
+    if(numa_id != nu)
+      init_shdmem(nu, keys[nu], shmids[nu], shm_data[nu], shm_len, VFILE_0, nu+1);
+
+    for(int i = 0; i < T_THREAD; i++) { shm_st[nu].a_written_s0[i]  = (std::atomic<uint64_t>*)((uintptr_t)(a_written_s0[i]) - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]); }
+    for(int i = 0; i < T_THREAD; i++) { shm_st[nu].a_written[i]     = (std::atomic<int>*)((uintptr_t)(a_written[i])    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]); }
+    for(int i = 0; i < T_THREAD; i++) { shm_st[nu].a_written_tt[i]  = (std::atomic<int>*)((uintptr_t)(a_written_tt[i]) - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]); }
+    for(int i = 0; i < RPROC;    i++) { shm_st[nu].a_written_reverse[i]  = (std::atomic<int>*)((uintptr_t)(a_written_reverse[i]) - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]); }
+
+    // shm_st[nu].atom_bit_share    = (void*)((uintptr_t)atom_bit_share   - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    // shm_st[nu].atom_bit          = (void*)((uintptr_t)atom_bit         - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+
+    shm_st[nu].tag      = (tagint*)((uintptr_t)atom->tag      - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].type     = (int*)((uintptr_t)atom->type        - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].mask     = (int*)((uintptr_t)atom->mask        - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    // shm_st[nu].image    = (imageint*)((uintptr_t)atom->image  - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    
+    // shm_st[nu].v    = new double*[atom->nmax];
+    // shm_st[nu].v[0] = (double*)((uintptr_t)atom->v[0]    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].x    = new double*[atom->nmax];
+    shm_st[nu].x[0] = (double*)((uintptr_t)atom->x[0]    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    // shm_st[nu].f    = new double*[atom->nmax * nthreads];
+    // shm_st[nu].f[0] = (double*)((uintptr_t)atom->f[0]    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+
+    // for(int i = 1; i < atom->nmax; i++) {
+    //   shm_st[nu].v[i] = shm_st[nu].v[i-1] + 3;
+    // }
+    for(int i = 1; i < atom->nmax; i++) {
+      shm_st[nu].x[i] = shm_st[nu].x[i-1] + 3;
+    }
+    // for(int i = 1; i < atom->nmax * nthreads; i++) {
+    //   shm_st[nu].f[i] = shm_st[nu].f[i-1] + 3;
+    // }
+
+    for(int viq = 0; viq < VCQ_NUM; viq++) {
+      shm_st[nu].opt_buf_send[viq] = new double*[opt_maxswap];
+      shm_st[nu].opt_buf_recv[viq] = new double*[opt_maxswap];
+      for(int iswap = 0; iswap < opt_maxswap; iswap++) {
+        shm_st[nu].opt_buf_send[viq][iswap] = (double*)((uintptr_t)opt_buf_send[viq][iswap] - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+        shm_st[nu].opt_buf_recv[viq][iswap] = (double*)((uintptr_t)opt_buf_recv[viq][iswap] - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+      }
+    }
+
+    for(int viq = 0; viq < NUMA_NUM; viq++) {
+      shm_st[nu].opt_force_recv[viq] = new double*[numa_maxswap+1];
+      for(int iswap = 0; iswap < numa_maxswap+1; iswap++) {
+        shm_st[nu].opt_force_recv[viq][iswap] = (double*)((uintptr_t)opt_force_recv[viq][iswap] - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+      }
+    }
+
+    for(int viq = 0; viq < NUMA_NUM; viq++) {
+      shm_st[nu].shm_numa_recvnum_numa[viq] = (uint64_t*)((uintptr_t)shm_numa_recvnum_numa[viq] - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    }
+
+    shm_st[nu].normal_data     = (double*)((uintptr_t)normal_data     - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].opt_recvnum    = (uint64_t*)((uintptr_t)opt_recvnum    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].opt_sendnum    = (uint64_t*)((uintptr_t)opt_sendnum    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].shm_sendnum    = (uint64_t*)((uintptr_t)shm_sendnum    - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].shm_nlocal     = (uint64_t*)((uintptr_t)shm_nlocal     - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].shm_recvnum_numa       = (uint64_t*)((uintptr_t)shm_recvnum_numa     - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+    shm_st[nu].shm_firstrecv_numa     = (uint64_t*)((uintptr_t)shm_firstrecv_numa     - (uintptr_t)shm_data[numa_id] + (uintptr_t)shm_data[nu]);
+
+    int shm_ptr = 0;
+
+    if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish setup_init_shdmem_region nu {}\n", nu);
+
+  }
+
+  a_written_id = 0;  
+  for(int i = 0; i < NUMA_NUM; i++) a_written_nu_id[i] = a_written_tt_id[i] = 0;
+}
+
+void CommBrick::init_shdmem(int &nu, key_t &key, int &shmid, void *&share_mem, int memlen, std::string vpfile, int __proj_id) {
+  int ret, pol;
+  int pagesize = sysconf(_SC_PAGESIZE);
+  struct bitmask *nmask = numa_allocate_nodemask();
+
+  memlen = (memlen + pagesize - 1) / pagesize;
+  memlen *= pagesize;
+
+  if((key = ftok(vpfile.c_str(), __proj_id)) < 0) {
+    error->one(FLERR, "ftok() get key failure: {} {} \n", key, strerror(errno));
+    return ; 
+  }
+
+  if(numa_id == nu)
+    shmid = shmget(key, memlen, IPC_CREAT | 0666);	//创建共享内存
+  
+  // MPI_Barrier(nuworld);
+
+  if(numa_id != nu)  
+    shmid = shmget(key, memlen,  0666);	//创建共享内存
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] get key_t {} and shmid  {} memlen {} \n", key, shmid, memlen);  
+
+  if(shmid < 0) {
+    error->one(FLERR, "shmget() creat shared memroy failure: {} \n", strerror(errno));
+    return ; 
+  }
+
+  share_mem = shmat(shmid, NULL, 0);	//将共享内存连接到当前进程的地址空间
+  if((void *) -1 == share_mem) {
+    error->one(FLERR, "shmat() alloc share_mem memroy failure: {} \n", strerror(errno));
+    return ;
+  }
+
+  if(numa_id == nu) {
+    numa_bitmask_clearall(nmask);
+    numa_bitmask_setbit(nmask, nu+4);
+    ret = mbind(share_mem, memlen, MPOL_BIND, nmask->maskp, nmask->size, MPOL_MF_STRICT);
+    if (ret < 0) {
+      error->one(FLERR, "mbind failure: {} \n", strerror(errno));
+    }
+
+    if (get_mempolicy(&pol, nmask->maskp, nmask->size, share_mem, MPOL_F_ADDR) < 0) {
+      printf("get_mempolicy pol %d mask %lx failure:%s\n",pol, *nmask->maskp & 0x3ff,strerror(errno)); fflush(stdout);
+      error->one(FLERR, "get_mempolicy pol {} mask {} failure:{} \n", pol, *nmask->maskp & 0x3ff,strerror(errno));
+    }
+    memset(share_mem, 0, memlen);
+  }
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] init_shdmem me {} memlen {} page size {} share_mem {} \n", me, memlen, sysconf(_SC_PAGESIZE), share_mem);   
+
+  // if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] finish init_shdmem \n");   
+}
+
+void CommBrick::delete_shdmem(int shmid, void * share_mem) {
+  if(shmdt(share_mem) == -1) {		//把共享内存从当前进程中分离
+    error->one(FLERR, "shmdt() failure: {} \n", strerror(errno));
+    return ;
+  }
+  shmctl(shmid, IPC_RMID, NULL);		//删除共享内存
+  return ;
+}
 
 void CommBrick::buildMPIType() {
     int block_lengths[4];
@@ -1007,10 +1852,13 @@ void CommBrick::utofu_recv(utofu_vcq_hdl_t vcq_hdl, uint64_t &edata, unsigned lo
   in_notice = notice;
 }
 
-void CommBrick::utofu_init(){
+void CommBrick::utofu_init_opt() {
   int rc, i;
 
   utofu_init_flag = true;
+
+  if(DEBUG_MSG || me == 0) utils::logmesg(lmp," utofu_init_opt opt_maxswap {} \n", opt_maxswap);
+
 
   for(i = 0; i < VCQ_NUM; i++){
     lcl_send_stadd[i]         = new utofu_stadd_t[opt_maxswap];
@@ -1018,8 +1866,8 @@ void CommBrick::utofu_init(){
     lcl_send_f_stadd[i]         = new utofu_stadd_t[opt_maxswap];
     lcl_recv_x_stadd[i]         = new utofu_stadd_t[opt_maxswap];
     lcl_comms[i]              = new Utofu_comm[opt_maxswap];
-    rmt_comms[i]              = new Utofu_comm[opt_maxswap];
     lcl_recv_comms[i]         = new Utofu_comm[opt_maxswap];
+    rmt_comms[i]              = new Utofu_comm[opt_maxswap];
   }
 
   edata                 = new uint8_t[opt_maxswap];
@@ -1075,26 +1923,36 @@ void CommBrick::utofu_init(){
     }
   }
 
-  if(DEBUG_MSG) utils::logmesg(lmp," utofu init nmax {} \n", atom->nmax);
+  if(DEBUG_MSG || me == 0) utils::logmesg(lmp," utofu init nmax {} total_buffer_size {} \n", atom->nmax, total_buffer_size);
+
+  for(int k = 0; k < VCQ_NUM; k++){
+    for(int i = 0; i < TNI_NUM; i++) {
+      rc  |= utofu_reg_mem(vcq_hdl_send[k][i], (void *)all_recv_buffer, sizeof(double) * total_buffer_size, 0, &all_send_stadd[k][i]);  
+      rc  |= utofu_reg_mem(vcq_hdl_send[k][i], (void *)atom->f[0], sizeof(double) * atom->nmax * 3, 0, &all_f_stadd[k][i]);
+
+      rc  |= utofu_reg_mem(vcq_hdl_recv[k][i], (void *)all_recv_buffer, sizeof(double) * total_buffer_size, 0, &all_recv_stadd[k][i]);   
+      rc  |= utofu_reg_mem(vcq_hdl_recv[k][i], (void *)atom->x[0], sizeof(double) * atom->nmax * 3, 0, &all_x_stadd[k][i]); 
+    }
+  }
 
   for(int k = 0; k < VCQ_NUM; k++) {
     for(int i = 0; i < opt_maxswap; i++) {
       int vcq_ptr = ((i / 2) % TNI_NUM);
-      rc  = utofu_reg_mem(vcq_hdl_send[k][vcq_ptr], (void *)opt_buf_send[k][i], sizeof(double) * opt_maxsend[i], 0, &lcl_send_stadd[k][i]);    
-      rc  |= utofu_reg_mem(vcq_hdl_send[k][vcq_ptr], (void *)atom->f[0], sizeof(double) * atom->nmax * 3, 0, &lcl_send_f_stadd[k][i]);         
+      lcl_send_stadd[k][i] = all_send_stadd[k][vcq_ptr];
+      lcl_send_f_stadd[k][i] = all_f_stadd[k][vcq_ptr];
       if(rc != UTOFU_SUCCESS) {
         error->one(FLERR,"utofu_reg_mem vcq_hdl_send error k {} i {} vcq_ptr {} rc {}\n", k, i, vcq_ptr, rc); 
       }
       lcl_comms[k][i].vcq_id        = lcl_vcq_id_send[k][vcq_ptr];
       lcl_comms[k][i].utofu_stadd   = lcl_send_stadd[k][i];
-      lcl_comms[k][i].utofu_f_stadd = lcl_send_stadd[k][i];
+      lcl_comms[k][i].utofu_f_stadd = lcl_send_f_stadd[k][i];
     }
   }
   for(int k = 0; k < VCQ_NUM; k++) {
     for(int i = 0; i < opt_maxswap; i++) {
       int vcq_ptr = ((i / 2) % TNI_NUM);
-      rc  = utofu_reg_mem(vcq_hdl_recv[k][vcq_ptr], (void *)opt_buf_recv[k][i], sizeof(double) * opt_maxsend[i], 0, &lcl_recv_stadd[k][i]);    
-      rc  |= utofu_reg_mem(vcq_hdl_recv[k][vcq_ptr], (void *)atom->x[0], sizeof(double) * atom->nmax * 3, 0, &lcl_recv_x_stadd[k][i]);   
+      lcl_recv_stadd[k][i] = all_recv_stadd[k][vcq_ptr];
+      lcl_recv_x_stadd[k][i] = all_x_stadd[k][vcq_ptr];
       if(rc != UTOFU_SUCCESS) {
          error->one(FLERR,"utofu_reg_mem vcq_hdl_recv error k {} i {} vcq_ptr {} rc {}\n", k, i, vcq_ptr, rc); 
       }
@@ -1103,30 +1961,6 @@ void CommBrick::utofu_init(){
       lcl_recv_comms[k][i].utofu_x_stadd  = lcl_recv_x_stadd[k][i];
     }
   }
-
-  // for(int k = 0; k < VCQ_NUM; k++) {
-  //   if(k % 2 == 0) {
-  //     for(int i = 0; i < opt_maxswap; i++) {
-  //       int vcq_ptr = ((i / 2) % TNI_NUM);
-  //       rc  = utofu_reg_mem(vcq_hdl_send[k][vcq_ptr], (void *)atom->f[0], sizeof(double) * atom->nmax * 3, 0, &lcl_send_f_stadd[k][i]);    
-  //       if(rc != UTOFU_SUCCESS) {
-  //         error->one(FLERR,"utofu_reg_mem vcq_hdl_send error k {}  i {} vcq_ptr {} rc {}\n", 2, i, vcq_ptr, rc); 
-  //       }
-  //       // lcl_comms[k][i].vcq_id        = lcl_vcq_id_send[k][vcq_ptr];
-  //       lcl_comms[k][i].utofu_f_stadd = lcl_send_f_stadd[k][i];
-  //     }
-  //   } else {
-  //     for(int i = 0; i < opt_maxswap; i++) {
-  //       int vcq_ptr = ((i / 2) % TNI_NUM);
-  //       rc  = utofu_reg_mem(vcq_hdl_recv[k][vcq_ptr], (void *)atom->x[0], sizeof(double) * atom->nmax * 3, 0, &lcl_recv_x_stadd[k][i]);
-  //       if(rc != UTOFU_SUCCESS) {
-  //         error->one(FLERR,"utofu_reg_mem vcq_hdl_recv error k {}  i {} vcq_ptr {} rc {}\n", 2, i, vcq_ptr, rc);
-  //       }
-  //       // lcl_recv_comms[k][i].vcq_id         = lcl_vcq_id_recv[k][vcq_ptr];
-  //       lcl_recv_comms[k][i].utofu_f_stadd  = lcl_recv_x_stadd[k][i];
-  //     }
-  //   }
-  // } 
 
   MPI_Request request;
   for(int k = 0; k < VCQ_NUM; k++){
@@ -1137,16 +1971,6 @@ void CommBrick::utofu_init(){
     }
   }
 
-  // if(DEBUG_MSG) {
-  //   for(int k = 0; k < VCQ_NUM; k++){
-  //     for(int i = 0; i < opt_maxswap; i++) {
-  //       utils::logmesg(lmp,"rmt {}, vcq_id {}, stadd {}, xstadd {}\n", 
-  //           opt_sendproc[i], rmt_comms[k][i].vcq_id, rmt_comms[k][i].utofu_stadd, rmt_comms[k][i].utofu_x_stadd); 
-  //     }
-      
-  //   }    
-  // }
-
   for(int k = 0; k < VCQ_NUM; k++){
     for(int i = 0; i < opt_maxswap; i++) {
       rc = utofu_set_vcq_id_path(&rmt_comms[k][i].vcq_id, NULL);
@@ -1155,7 +1979,630 @@ void CommBrick::utofu_init(){
       }
     }
   }
+
+  if(comm->numa_flag) utofu_init_numa();
 }
+
+void CommBrick::utofu_init_numa() {
+  int rc;
+
+  if(DEBUG_MSG || me == 0) utils::logmesg(lmp," utofu_init_numa thr_maxswap {} numa_maxswap {} \n", thr_maxswap,numa_maxswap);
+
+  for(int i = 0; i < VCQ_NUM; i++){
+    lcl_recv_numa_comms[i]          = new Utofu_comm[numa_maxswap];
+    nu_rmt_comms[i]                 = new Utofu_comm[numa_maxswap];
+  }
+
+  for(int k = 0; k < VCQ_NUM; k++) {
+    for(int tid = 0; tid < thr_maxswap; tid++) {
+      for(auto &iswap : thr_swap_full[tid]) {
+        lcl_recv_numa_comms[k][iswap].vcq_id              = lcl_vcq_id_recv[k][tid];
+        lcl_recv_numa_comms[k][iswap].utofu_stadd         = all_recv_stadd[k][tid];
+      }
+    }
+  }
+
+  MPI_Request request;
+
+  for(int k = 0; k < VCQ_NUM; k++) {
+    for(auto &iswap : numa_swap_full) {
+      MPI_Irecv(&nu_rmt_comms[k][iswap], 1, utofu_comm_type, numa_sendproc[iswap], 0, MPI_COMM_WORLD, &request);  
+      MPI_Send(&lcl_recv_numa_comms[k][iswap], 1, utofu_comm_type, numa_recvproc[iswap], 0, MPI_COMM_WORLD); 
+      MPI_Wait(&request, MPI_STATUS_IGNORE);
+    }
+  }
+  
+  for(int k = 0; k < VCQ_NUM; k++){
+    for(auto &iswap : numa_swap_full) {
+      rc |= utofu_set_vcq_id_path(&nu_rmt_comms[k][iswap].vcq_id, NULL);
+    }
+    if(rc != UTOFU_SUCCESS) {
+      error->one(FLERR,"utofu_set_vcq_id_path error\n"); 
+    }
+  }
+
+  MPI_Barrier(world);  
+
+  // if(DEBUG_MSG || me == 0) utils::logmesg(lmp,"[INFO] finish init utofu numa\n");
+
+
+
+}
+
+void CommBrick::borders_one_parrral_numa(int tid) {
+  int i,n,itype,iswap,dim,ineed, k, rswap;
+  double **x;
+  std::string mesg;
+  AtomVec *avec = atom->avec;
+  uint64_t edata_recv, r_edata_recv;
+  int nlocal = atom->nlocal;
+
+  struct utofu_mrq_notice in_notice;
+  int nbuf_len;
+  int pkt_size[NUMA_NUM];
+  int pkt_offset[BORDER_ELEMENT][NUMA_NUM] = {{sizeof(double)}};
+  
+  x       = atom->x;
+
+  if(tid == 11) {
+    MPI_Allgather(&atom->nlocal,1,MPI_INT,numa_nlocal,1,MPI_INT,nuworld);
+
+    for(int i = 0; i < BORDER_ELEMENT; i++) {
+      int _len = i == 0 ? 24 : 4;
+      for(int nu = 0; nu < NUMA_NUM; nu++) {
+        if((i == BORDER_ELEMENT - 1) && (nu == NUMA_NUM -1)) break;
+        int _o = i * NUMA_NUM + nu;
+        *(pkt_offset[0] + _o + 1) =  *(pkt_offset[0] + _o) + _len * numa_nlocal[nu];
+      }
+    }
+
+    nlocal_offset[0] = 0; 
+    numa_nlocal_all = numa_nlocal[0];
+    for(int nu = 1; nu < NUMA_NUM; nu++) {
+      nlocal_offset[nu] = numa_nlocal[nu-1]+nlocal_offset[nu-1];
+      numa_nlocal_all += numa_nlocal[nu];
+    }
+
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] border nlocal "),  numa_nlocal, NUMA_NUM, 1);
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] border pkt_offset "),  pkt_offset[0], NUMA_NUM * BORDER_ELEMENT, 1);
+
+    // int ptr_offset = 0;
+    // for(int nu = 1; nu <= numa_id; nu++) {
+    //   ptr_offset += get_align_border_ptr(numa_nlocal[nu-1]) + 1;
+    // }
+
+    opt_buf_send[c_vcq][0][0] = numa_nlocal_all;
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      // shm_st[nu].opt_buf_send[c_vcq][0][ptr_offset] = nlocal;
+      // avec->pack_border_numa(shm_st[nu].opt_buf_send[c_vcq][0]+ptr_offset+1);
+      memcpy((char*)(shm_st[nu].opt_buf_send[c_vcq][0]) + pkt_offset[0][numa_id], atom->x[0], sizeof(double) * nlocal * 3);
+      memcpy((char*)(shm_st[nu].opt_buf_send[c_vcq][0]) + pkt_offset[1][numa_id], atom->tag,  sizeof(tagint) * nlocal);
+      memcpy((char*)(shm_st[nu].opt_buf_send[c_vcq][0]) + pkt_offset[2][numa_id], atom->type, sizeof(int) * nlocal);
+      memcpy((char*)(shm_st[nu].opt_buf_send[c_vcq][0]) + pkt_offset[3][numa_id], atom->mask, sizeof(int) * nlocal);
+      *(shm_st[nu].a_written_tt[2]) += 1;
+    }
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      lb_offset[nu] = nlocal_offset[nu];
+      if(nu < numa_id) lb_offset[nu] += nlocal;
+      else if(nu == numa_id) lb_offset[nu] = 0;
+    }
+
+    // load balance divide the atoms
+    {
+      if(lb_flag) {
+        pair_len = 0;
+        int ifrom, ito;
+        int idelta_i = numa_nlocal_all / NUMA_NUM;
+        int idelta_j = numa_nlocal_all % NUMA_NUM;
+        int _bias    = idelta_j == 0 ? 0 : 1;
+        
+        if(numa_id >= idelta_j) {
+          ifrom = (idelta_i + _bias) * idelta_j + idelta_i * (numa_id - idelta_j);
+          ito = ifrom + idelta_i; 
+        } else {
+          ifrom = (idelta_i + _bias) * (numa_id);
+          ito = ifrom + idelta_i + _bias; 
+        }
+        ito = (ito > numa_nlocal_all) ? numa_nlocal_all : ito; 
+        
+        for(int i = ifrom; i < ito; i++) {
+          pair_index[pair_len] = i;
+          if(pair_index[pair_len] < nlocal_offset[numa_id]) pair_index[pair_len] += nlocal;
+          else if((pair_index[pair_len] >= nlocal_offset[numa_id]) && (pair_index[pair_len] < nlocal_offset[numa_id] + nlocal)) pair_index[pair_len] -= nlocal_offset[numa_id];
+
+          pair_len++;
+        }
+      } else {
+        pair_len = nlocal;
+        for(int i = 0; i < nlocal; i++) pair_index[i] = i;  
+      }
+
+
+      if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] pair_index "),  pair_index, pair_len, 1);
+    }
+
+
+    memset(shm_numa_recvnum_numa[numa_id], 0, sizeof(uint64_t)*(numa_maxswap));
+    numa_recvnum = shm_numa_recvnum_numa[numa_id];
+
+    while((*(shm_st[numa_id].a_written_tt[2]) != NUMA_NUM));
+    *(shm_st[numa_id].a_written_tt[2]) = 0;
+
+
+    if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border finish atom memcpy \n"); 
+
+    if(DEBUG_MSG)
+      for(int nu = 0; nu < NUMA_NUM; nu++) {
+          utils::logmesg_arry_x(lmp, fmt::format("[NUMA] selfsend iswap {}", 0), 
+                                (double*)((char*)(opt_buf_send[c_vcq][0])+pkt_offset[0][nu]), numa_nlocal[nu]*3, 1); 
+      }
+  }
+
+  lmp->parral_barrier(12, tid);
+
+    // if(DEBUG_MSG) {
+    //   utils::logmesg_arry_parral(lmp, fmt::format("[NUMA] border nbuf_len tid {} ", tid), nbuf_len, numa_swap[tid]); 
+    // }
+  if(tid < thr_maxswap) {
+    nbuf_len = 0;
+    nbuf_len = numa_nlocal_all * (8 * 3 + 4 + 4 + 4) + 8;
+    // for(int nu = 0; nu < NUMA_NUM; nu++) {
+    //   nbuf_len += recv_swap_mnt[numa_maxswap].pkt_size[nu];
+    // }
+
+    // if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border tid {} nbuflen {}\n", tid, nbuf_len); 
+
+
+    for(auto &iswap : thr_swap[tid]) {
+      if(nbuf_len > opt_maxsend[0]) {
+        error->one(FLERR, "[ERROR]  buffer not enough maxsend {} buflen {}", opt_maxsend[0], nbuf_len );
+      }
+      warp_utofu_put(vcq_hdl_send[c_vcq][tid], nu_rmt_comms[c_vcq][iswap].vcq_id, all_send_stadd[c_vcq][tid]+opt_stadd_send_offset[c_vcq][0], 
+              nu_rmt_comms[c_vcq][iswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][iswap], sizeof(double) * nbuf_len, edata[iswap], cbvalue[iswap], post_flags, (void*)opt_buf_send[c_vcq][0]);  
+    }
+    for(auto &iswap : thr_swap[tid]) {
+      warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][tid], cbvalue_send[iswap], post_flags);
+    }
+
+    for(auto &iswap : thr_swap[tid]) {
+      utofu_recv(vcq_hdl_recv[c_vcq][tid], edata_recv, post_flags, in_notice);
+      numa_recvnum[edata_recv] = opt_buf_recv[c_vcq][edata_recv][0];        
+
+      int _len = numa_recvnum[edata_recv];
+      if(numa_pbc_flag_recv[edata_recv]) {
+        double dx, dy, dz;
+        dx = numa_pbc_recv[edata_recv][0] * domain->xprd;  dy = numa_pbc_recv[edata_recv][1] * domain->yprd;  dz = numa_pbc_recv[edata_recv][2] * domain->zprd;
+        for(int i = 0; i < _len; i++) {
+          opt_buf_recv[c_vcq][edata_recv][1 + i * 3 + 0] += dx;
+          opt_buf_recv[c_vcq][edata_recv][1 + i * 3 + 1] += dy;
+          opt_buf_recv[c_vcq][edata_recv][1 + i * 3 + 2] += dz;
+        }
+
+        if(DEBUG_MSG) utils::logmesg_arry_x(lmp, fmt::format("[NUMA] recve {} flag {} {} {} {}",
+                                  edata_recv, numa_pbc_flag_recv[edata_recv], numa_pbc_recv[edata_recv][0],numa_pbc_recv[edata_recv][1],numa_pbc_recv[edata_recv][2]), 
+                                       &opt_buf_recv[c_vcq][edata_recv][1], _len * 3, 1); 
+
+      }
+    }
+  }
+
+  if(tid == 11) {
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      char* buf = (char*)opt_buf_send[c_vcq][0];
+      int len = numa_nlocal[nu];
+      memcpy(atom->x[0] + lb_offset[nu] * 3,  (void*)(buf + pkt_offset[0][nu]), sizeof(double) * len * 3); 
+      memcpy(atom->tag  + lb_offset[nu],      (void*)(buf + pkt_offset[1][nu]), sizeof(tagint) * len);     
+      memcpy(atom->type + lb_offset[nu],      (void*)(buf + pkt_offset[2][nu]), sizeof(int) * len);
+      memcpy(atom->mask + lb_offset[nu],      (void*)(buf + pkt_offset[3][nu]), sizeof(int) * len);
+    }
+  }
+
+  lmp->parral_barrier(12, tid);
+
+  //  通信 recvnum  firstrecv
+  if(tid == 11) {
+
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] shm_numa_recvnum_numa "),  numa_recvnum, (numa_maxswap), 1); 
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      memcpy(shm_st[nu].shm_numa_recvnum_numa[numa_id],  numa_recvnum, sizeof(uint64_t)*(numa_maxswap));
+      *(shm_st[nu].a_written_tt[3]) += 1;
+    }
+
+    while(*(a_written_tt[3]) != 3);
+    *(a_written_tt[3]) = 0;
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      for(int i = 0; i < numa_maxswap; i++) {
+        if(*(numa_recvnum+i) == 0) *(numa_recvnum+i) = *(shm_numa_recvnum_numa[nu]+i);
+      }
+    }
+    // for(int nu = 0; nu < NUMA_NUM; nu++) {
+    //   if(nu == numa_id) continue;
+    //   if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] shm_numa_recvnum_numa nu {} ", nu),  shm_numa_recvnum_numa[nu], numa_maxswap, 1); 
+    // }
+
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] shm_numa_recvnum_numa "),  numa_recvnum, numa_maxswap, 1); 
+
+    numa_firstrecv[0] = numa_nlocal_all;
+    for(int iswap = 1; iswap < numa_maxswap; iswap++) {
+      numa_firstrecv[iswap] = numa_recvnum[iswap-1] + numa_firstrecv[iswap-1];
+    }
+    for(int iswap = 0; iswap < numa_maxswap; iswap++) {
+      if(numa_recvnum[iswap] <= 0 || numa_recvnum[iswap] > opt_maxsend[0]) {
+        error->one(FLERR, "[ERROR]  numa_recvnum error {}\n", numa_recvnum[iswap]);
+      }
+    }
+
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] numa_firstrecv "), numa_firstrecv, numa_maxswap, 1); 
+
+    atom->nghost = 0;
+
+    for(int iswap = 0; iswap < numa_maxswap; iswap++) {
+      atom->nghost += numa_recvnum[iswap];
+    }
+
+    atom->nunlocal = numa_nlocal_all;
+    atom->nunghost = atom->nghost;
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      atom->nghost += numa_nlocal[nu];
+    }
+
+    if(atom->nghost + atom->nlocal > atom->nmax ) {
+      error->one(FLERR, "[ERROR]  atom exceed nmax {} atom nlocl {} nghost {} \n", atom->nmax, atom->nlocal, atom->nghost);
+    }
+
+    if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border begin to copy buffer \n"); 
+  }
+
+  lmp->parral_barrier(12, tid);
+
+  if(tid < thr_maxswap) {
+    for(auto &iswap : thr_swap[tid]) {
+      for(int nu = 0; nu < NUMA_NUM; nu++) {
+          char* buf = (char*)opt_buf_recv[c_vcq][iswap];
+          int offset = sizeof(double);
+          int len = numa_recvnum[iswap];
+            // if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border unpack nu {} ptr {} first_recv {} len {} offset {} \n", nu, ptr, _first_recv, len, recv_swap_mnt[iswap].pkt_offset[ii]+1);
+
+            // if(DEBUG_MSG) utils::logmesg_arry_x(lmp, fmt::format("[NUMA] recied x nu {} iswap {} ", ), buf,  * 3, 1); 
+          memcpy(shm_st[nu].x[0] + numa_firstrecv[iswap] * 3,  (void*)(buf + offset), sizeof(double) * len * 3);  offset += sizeof(double) * len * 3;
+          memcpy(shm_st[nu].tag  + numa_firstrecv[iswap],      (void*)(buf + offset), sizeof(tagint) * len);      offset += sizeof(tagint) * len;
+          memcpy(shm_st[nu].type + numa_firstrecv[iswap],      (void*)(buf + offset), sizeof(int) * len);         offset += sizeof(int) * len;
+          memcpy(shm_st[nu].mask + numa_firstrecv[iswap],      (void*)(buf + offset), sizeof(int) * len);         offset += sizeof(int) * len;
+      }
+    }
+  }
+  
+  // __asm__ __volatile__ ("" ::: "memory");
+
+  lmp->parral_barrier(12, tid);
+
+  if(tid == 11) {
+    // for(int iswap = 0; iswap < numa_maxswap; iswap++)
+    //   if(tid == 11)  if(DEBUG_MSG) utils::logmesg_arry_x(lmp, fmt::format("[NUMA] atom->x iswap {} recvporc {} ", iswap, numa_recvproc[iswap]), 
+    //                                     atom->x[0] + numa_firstrecv[iswap] * 3, numa_recvnum[iswap] * 3, 1); 
+
+    if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border finish copy buf, begin to sync  \n"); 
+
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      *(shm_st[nu].a_written_tt[0]) += 1;
+    }
+
+    while(1) {
+      int _t = *(a_written_tt[0]);
+      if(_t == 3) break;
+    }
+    *(a_written_tt[0]) = 0;
+
+    // MPI_Barrier(nuworld);
+
+    if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border finish snyc  \n"); 
+
+
+    // if(DEBUG_MSG) {
+    //   std::string tmp;
+    //   tmp +=  fmt::format("[info] pair_index len {} ", pair_len);
+    //   for(int i = 0; i < pair_len; i++) {
+    //       tmp += fmt::format("  {}:{}:{}", i, pair_index[i], atom->tag[pair_index[i]]);
+    //   }
+    //   tmp += "\n";
+    //   utils::logmesg(lmp, tmp);
+    // }  
+  }
+
+  if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] border in finish tid {}  \n", tid); 
+
+
+
+}
+
+void CommBrick::forward_comm_parral_numa(int tid) {
+  int nbuf_len;
+
+  AtomVec *avec = atom->avec;
+  double **x = atom->x;
+  double *buf;
+  int iswap;
+  struct utofu_mrq_notice in_notice;
+  int i;
+
+  std::string mesg;
+  uint64_t edata_recv;
+
+  if(tid < NUMA_NUM) {
+    memcpy(shm_st[tid].opt_buf_send[c_vcq][0] + nlocal_offset[numa_id] * 3 , atom->x[0], sizeof(double) * atom->nlocal * 3);
+    *(shm_st[tid].a_written_tt[1]) += 1;
+
+    if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] forward finish atom memcpy nlocal tid {} \n", tid);
+  }
+
+  lmp->parral_barrier(12, tid);
+
+  if(tid < thr_maxswap) {
+    while((*(a_written_tt[1])) != NUMA_NUM);
+
+    nbuf_len = numa_nlocal_all * 3;
+
+    for(auto &iswap : thr_swap[tid]) {
+      if(nbuf_len > opt_maxsend[0]) {
+        error->one(FLERR, "[ERROR]  buffer not enough maxsend {} buflen {}", opt_maxsend[0], nbuf_len );
+      }
+      warp_utofu_put(vcq_hdl_send[c_vcq][tid], nu_rmt_comms[c_vcq][iswap].vcq_id, all_send_stadd[c_vcq][tid]+opt_stadd_send_offset[c_vcq][0], 
+                nu_rmt_comms[c_vcq][iswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][iswap], sizeof(double) * nbuf_len, edata[iswap], cbvalue[iswap], post_flags, (void*)opt_buf_send[c_vcq][0]);  
+
+      // if(DEBUG_MSG)  utils::logmesg_arry_x(lmp, fmt::format("[NUMA] send x iswap {}", 0), opt_buf_send[c_vcq][0], numa_nlocal_all * 3, 1); 
+    }
+    for(auto &iswap : thr_swap[tid]) {
+      warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][tid], cbvalue_send[iswap], post_flags);
+    }
+
+    for(auto &iswap : thr_swap[tid]) {
+      utofu_recv(vcq_hdl_recv[c_vcq][tid], edata_recv, post_flags, in_notice);
+
+      int _len = numa_recvnum[edata_recv];
+      if(numa_pbc_flag_recv[edata_recv]) {
+        double dx, dy, dz;
+        dx = numa_pbc_recv[edata_recv][0] * domain->xprd;  dy = numa_pbc_recv[edata_recv][1] * domain->yprd;  dz = numa_pbc_recv[edata_recv][2] * domain->zprd;
+        for(int i = 0; i < _len; i++) {
+          opt_buf_recv[c_vcq][edata_recv][i * 3 + 0] += dx;
+          opt_buf_recv[c_vcq][edata_recv][i * 3 + 1] += dy;
+          opt_buf_recv[c_vcq][edata_recv][i * 3 + 2] += dz;
+        }
+      }
+      for(int nu = 0; nu < NUMA_NUM; nu++) {
+        memcpy(shm_st[nu].x[0] + numa_firstrecv[edata_recv] * 3,  opt_buf_recv[c_vcq][edata_recv], sizeof(double) * _len * 3); 
+      }
+    }
+  }
+
+  if(tid == 11) {
+    while((*(a_written_tt[1])) != NUMA_NUM);
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      int len = numa_nlocal[nu];
+      memcpy(atom->x[0] + lb_offset[nu] * 3,  opt_buf_send[c_vcq][0]+ nlocal_offset[nu]*3, sizeof(double) * len * 3); 
+    }
+  }
+
+  lmp->parral_barrier(12, tid);
+
+  if(tid == 11) {
+    *(a_written_tt[1]) = 0;
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      *(shm_st[nu].a_written_tt[0]) += 1;
+    }
+
+    while(*(a_written_tt[0]) != 3);
+    *(a_written_tt[0]) = 0;
+  }
+
+
+  // if(DEBUG_MSG)  utils::logmesg(lmp," opt_forward_parral finish parral tid {} \n", tid);  
+  
+  #ifdef THR_TIME_TEST
+    td->timer(Timer::FORWARD);
+  #endif
+}
+
+void CommBrick::reverse_comm_parral_numa(int tid) {
+  int n, i;
+  AtomVec *avec = atom->avec;
+  double **f = atom->f;
+  int iswap, rswap;
+  struct utofu_mrq_notice in_notice;
+  std::string mesg;
+  uint64_t edata_recv, r_edata_recv;
+  int nbuf_len[RPROC];
+
+  if(tid == 11) {
+    self_timer->stamp();
+  }
+
+  for(int iswap = tid; iswap < numa_maxswap; iswap += T_THREAD) {
+    int _to_numa_id = swap2numa_swap[iswap];
+
+    if(_to_numa_id != numa_id)
+      memcpy(shm_st[_to_numa_id].opt_force_recv[numa_id][iswap], atom->f[0]+numa_firstrecv[iswap]*3, numa_recvnum[iswap]*3*sizeof(double));
+    else
+      memcpy(opt_buf_send[c_vcq][iswap], atom->f[0]+numa_firstrecv[iswap]*3, numa_recvnum[iswap]*3*sizeof(double));
+    // if(DEBUG_MSG && (numa_recvproc[iswap] / 4 == 0)) 
+    //       utils::logmesg_arry_x(lmp,fmt::format("[info] send nu 2 "), atom->f[0]+(numa_firstrecv[iswap] + 108*2)*3, 3 * 108, 1);
+    
+    __asm__ __volatile__ ("" ::: "memory");
+    *(shm_st[_to_numa_id].a_written_reverse[iswap]) += 1;
+
+    // if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] reverse finish copy opt iswap {} numa_id {} swap {} \n", 
+    //                                             iswap, _to_numa_id, iswap);
+  }
+
+  // lmp->parral_barrier(12, tid);
+
+  // if(tid == 11) {
+  //   MPI_Barrier(nuworld);
+  //   while(*(a_written_reverse[numa_maxswap]) != reverse_target_bits[numa_maxswap]);
+  //   self_timer->stamp(Timer::REVERSE_CPY);
+  // }
+
+  // lmp->parral_barrier(12, tid);
+
+
+  if(tid < thr_maxswap) {
+    for(auto &iswap : thr_swap[tid]) {
+      nbuf_len[iswap] = numa_recvnum[iswap] * 3;
+    }
+
+    for(auto &iswap : thr_swap[tid]) {
+      int rswap = iswap % 2 == 0 ? iswap + 1 : iswap -1;
+      
+      while(*(a_written_reverse[iswap]) != NUMA_NUM);
+      *(a_written_reverse[iswap]) = 0;   
+
+      for(int nu = 0; nu < NUMA_NUM; nu++) {
+        if(nu == numa_id) continue;
+        for(int atom_i = 0; atom_i < numa_recvnum[iswap] * 3; atom_i++) {
+          opt_buf_send[c_vcq][iswap][atom_i] += opt_force_recv[nu][iswap][atom_i];
+        }
+      }
+      
+      // if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] send iswap {} proc {} nbuf_len {} ", rswap, numa_sendproc[rswap], nbuf_len[iswap]), 
+      //                 opt_buf_send[c_vcq][iswap], (recv_swap_mnt[iswap].atom_num[3] + recv_swap_mnt[iswap].atom_offset[3]) * 3, 1);
+      if(nbuf_len[iswap] > opt_maxsend[0]) {
+        error->one(FLERR, "[ERROR]  buffer not enough maxsend {} buflen {}", opt_maxsend[0], nbuf_len[iswap] );
+      }
+
+      warp_utofu_put(vcq_hdl_send[c_vcq][tid], nu_rmt_comms[c_vcq][rswap].vcq_id, all_send_stadd[c_vcq][tid]+opt_stadd_send_offset[c_vcq][iswap], 
+        nu_rmt_comms[c_vcq][rswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][iswap],  nbuf_len[iswap] * sizeof(double), edata[iswap], cbvalue[iswap], post_flags, (void*)opt_buf_send[c_vcq][iswap]);  
+    }
+
+    for(auto &iswap : thr_swap[tid]) {
+      int rswap = iswap % 2 == 0 ? iswap + 1 : iswap -1;
+      warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][tid], cbvalue_send[rswap], post_flags);
+    }
+
+    if(thr_swap[tid].size()) {
+      int _swap = thr_swap[tid][0];
+      memset(opt_buf_send[c_vcq][_swap], 0, sizeof(double) * 3 * numa_nlocal_all);
+    }
+    
+    for(auto &iswap : thr_swap[tid]) {
+      int _swap = thr_swap[tid][0];
+      int rswap = iswap % 2 == 0 ? iswap + 1 : iswap -1;
+
+      utofu_recv(vcq_hdl_recv[c_vcq][tid], edata_recv, post_flags, in_notice);
+
+      int r_edata_recv = edata_recv % 2 == 0 ? edata_recv + 1 : edata_recv -1;
+      // if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] reverse recv {} \n", edata_recv);
+
+      // if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] recv iswap {} recvproc {}", edata_recv, numa_recvproc[edata_recv]), opt_buf_recv[c_vcq][edata_recv], 3 * numa_nlocal_all, 1);
+      // if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] recv nu 2 iswap {} recvproc {}", edata_recv, numa_recvproc[edata_recv]), opt_buf_recv[c_vcq][edata_recv]+nlocal_offset[2]*3, 3 * numa_nlocal[2], 1);
+
+      for(int atom_i = 0; atom_i < 3 * numa_nlocal_all; atom_i++) {
+        opt_buf_send[c_vcq][_swap][atom_i] += opt_buf_recv[c_vcq][edata_recv][atom_i];
+      }
+    }
+  }
+
+  if(tid == 11) {
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      int atom_i, atom_j, i;
+      for(atom_i = nlocal_offset[nu], atom_j = lb_offset[nu], i = 0; i < numa_nlocal[nu]; atom_i++, atom_j++, i++) {
+        opt_force_recv[numa_id][numa_maxswap][atom_i*3+0] += atom->f[atom_j][0];
+        opt_force_recv[numa_id][numa_maxswap][atom_i*3+1] += atom->f[atom_j][1];
+        opt_force_recv[numa_id][numa_maxswap][atom_i*3+2] += atom->f[atom_j][2];
+      }
+    }
+  }
+
+  lmp->parral_barrier(12, tid);
+
+  if(tid == 11) {
+    // if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin reduce all thread data thr_maxswap {} \n", thr_maxswap);
+
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] lb_offset "),  lb_offset, NUMA_NUM, 1); 
+    if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] nlocal_offset "),  nlocal_offset, NUMA_NUM, 1); 
+
+    for(int _tid = 0; _tid < thr_maxswap; _tid++) {
+      if(thr_swap[_tid].size()) {
+        int _swap = thr_swap[_tid][0];
+        for(int atom_i = 0; atom_i < 3 * numa_nlocal_all; atom_i++) {
+          opt_force_recv[numa_id][numa_maxswap][atom_i] += opt_buf_send[c_vcq][_swap][atom_i];
+        }
+      }
+    }
+
+    // if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish reduce all thread data\n");
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      memcpy(shm_st[nu].opt_force_recv[numa_id][numa_maxswap], opt_force_recv[numa_id][numa_maxswap] + nlocal_offset[nu] * 3, sizeof(double)*numa_nlocal[nu]*3);
+      *(shm_st[nu].a_written_tt[4]) += 1;
+    }
+
+    for(int atom_i = 0; atom_i < atom->nlocal; atom_i++) {
+      atom->f[atom_i][0] += opt_force_recv[numa_id][numa_maxswap][(atom_i + nlocal_offset[numa_id])*3+0];
+      atom->f[atom_i][1] += opt_force_recv[numa_id][numa_maxswap][(atom_i + nlocal_offset[numa_id])*3+1];
+      atom->f[atom_i][2] += opt_force_recv[numa_id][numa_maxswap][(atom_i + nlocal_offset[numa_id])*3+2];
+    }
+
+    while((*(a_written_tt[4])) != 3);
+    *(a_written_tt[4]) = 0;
+
+    for(int nu = 0; nu < NUMA_NUM; nu++) {
+      if(nu == numa_id) continue;
+      for(int atom_i = 0; atom_i < atom->nlocal; atom_i++) {
+        atom->f[atom_i][0] += opt_force_recv[nu][numa_maxswap][atom_i*3+0];
+        atom->f[atom_i][1] += opt_force_recv[nu][numa_maxswap][atom_i*3+1];
+        atom->f[atom_i][2] += opt_force_recv[nu][numa_maxswap][atom_i*3+2];
+      }
+    }
+
+    memset(opt_force_recv[numa_id][numa_maxswap], 0, numa_nlocal_all * 3 * sizeof(double));
+    // self_timer->stamp(Timer::REVERSE_REDUCE);
+  }
+
+
+  // if(DEBUG_MSG) {
+  //   utils::logmesg(lmp,"[info] finish opt_reverse_comm_parrel over tid {}\n", tid);
+  // }
+
+
+
+
+  // #ifdef THR_TIME_TEST
+  //   td->timer(Timer::REVERSE);
+  // #endif
+}
+
+void CommBrick::reverse_comm_parral_unpack_numa(){
+  int iswap, rswap;
+  AtomVec *avec = atom->avec;
+
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry_r(lmp, fmt::format("opt_reverse_comm_parral_unpack remaind_iswap "), remaind_iswap, opt_maxswap, COMM_STEP); 
+  // }
+
+  for(iswap = 0 ; iswap < opt_maxswap; iswap += comm_step) {
+    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+    if (opt_size_reverse_recv[rswap]) {
+      if(remaind_iswap[rswap]){
+        avec->unpack_reverse(opt_sendnum[iswap],opt_sendlist[iswap],opt_buf_recv[c_vcq][rswap]);
+      }
+    }
+  }
+}
+
 
 #ifdef OPT_COMM_TEST
 void CommBrick::borders() {
@@ -1174,8 +2621,7 @@ void CommBrick::borders() {
   }
 
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin opt_border maxiswap {}  local {}\n", opt_maxswap, atom->nlocal);   
-
-
+ 
   int ibin;
   for(i = 0; i < atom->nlocal; i++) {
     ibin = atom2bin(x[i], bin_split_line);
@@ -1295,8 +2741,6 @@ void CommBrick::borders() {
     utils::logmesg_arry(lmp, fmt::format("opt_border_one opt_forward_send_pos "), opt_forward_send_pos, opt_maxswap, COMM_STEP); 
   }
 
-
-
   c_vcq = (c_vcq + 1) % VCQ_NUM;
 
   if ((atom->molecular != Atom::ATOMIC)
@@ -1316,8 +2760,7 @@ void CommBrick::borders() {
 
 
 
-void CommBrick::exchange()
-{
+void CommBrick::exchange() {
   int i,j,m,nlocal, nrecv[SWAP_NUM], nsend[SWAP_NUM], dim;
   double value[3];
   double **x;
@@ -1338,7 +2781,7 @@ void CommBrick::exchange()
   atom->nghost = 0;
   atom->avec->clear_bonus();
 
-  if(DEBUG_MSG) utils::logmesg(lmp, "[info] exchange begin cur c_vcq: {} \n", c_vcq);
+  // if(DEBUG_MSG) utils::logmesg(lmp, "[info] exchange begin cur c_vcq: {} \n", c_vcq);
 
 
   // insure send buf has extra space for a single atom
@@ -1380,7 +2823,7 @@ void CommBrick::exchange()
       
     for(int k = 0; k < 3; k++){
       if(x[i][k] < sublo[k] || x[i][k] >= subhi[k]) {
-        for(iswap = 0; iswap < opt_maxswap; iswap++){
+        for(iswap = 0; iswap < EXCH_SWAP_NUM; iswap++){
           if(swap_direct[iswap][k] != 0) {
             belong = in_neighbor_box(x[i], neigh_sublo[opt_sendproc[iswap]],neigh_subhi[opt_sendproc[iswap]]);      
             if(belong) break;
@@ -1413,30 +2856,27 @@ void CommBrick::exchange()
   atom->nlocal = nlocal;
 
   
-  for (i = 0; i < opt_maxswap; i+=1) {
+  for (i = 0; i < EXCH_SWAP_NUM; i+=1) {
     opt_buf_send[c_vcq][i][0] = nsend[i];
   }
 
   if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("[info] exchange nsend "), nsend, opt_maxswap, 1);
+    utils::logmesg_arry(lmp, fmt::format("[info] exchange nsend "), nsend, EXCH_SWAP_NUM, 1);
   }
 
-  for (iswap = opt_maxswap - 1; iswap >= 0; iswap--) {
-      warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap], 
-              rmt_comms[c_vcq][iswap].utofu_stadd, sizeof(double) * nsend[iswap], edata[iswap], cbvalue[iswap], post_flags, opt_buf_send[c_vcq][iswap]);  
+  for (iswap = EXCH_SWAP_NUM - 1; iswap >= 0; iswap--) {
+      warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap]+opt_stadd_send_offset[c_vcq][iswap], 
+              rmt_comms[c_vcq][iswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][iswap], sizeof(double) * nsend[iswap], edata[iswap], cbvalue[iswap], post_flags, opt_buf_send[c_vcq][iswap]);  
   }
 
-  for (iswap = opt_maxswap - 1; iswap >= 0; iswap--) {
+  for (iswap = EXCH_SWAP_NUM - 1; iswap >= 0; iswap--) {
     warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], cbvalue_send[iswap], post_flags);
   }
-  for (iswap = opt_maxswap - 1; iswap >= 0; iswap--) {
-    warp_utofu_poll_mrq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], edata_send[iswap], post_flags, in_notice);
-  }
 
-  if(DEBUG_MSG) utils::logmesg(lmp, "exchange recv ");
-  for (iswap = 0; iswap < opt_maxswap; iswap+=1) {
+  // if(DEBUG_MSG) utils::logmesg(lmp, "exchange recv ");
+  for (iswap = 0; iswap < EXCH_SWAP_NUM; iswap+=1) {
     utofu_recv(vcq_hdl_recv[c_vcq][(iswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice); 
-    if(DEBUG_MSG) utils::logmesg(lmp," {}:{} ", edata_recv, (int)opt_buf_recv[c_vcq][edata_recv][0]);
+    // if(DEBUG_MSG) utils::logmesg(lmp," {}:{} ", edata_recv, (int)opt_buf_recv[c_vcq][edata_recv][0]);
     nrecv[edata_recv] = opt_buf_recv[c_vcq][edata_recv][0];
 
     if(nrecv[edata_recv] > 1) {
@@ -1457,15 +2897,9 @@ void CommBrick::exchange()
       }
     }
   }
-  if(DEBUG_MSG) utils::logmesg(lmp, "\n");
 
   if(DEBUG_MSG) {
-    mesg = fmt::format("[info] exchange nrecv "); 
-    for(iswap = 0; iswap < opt_maxswap; iswap+=1) {
-      mesg += fmt::format("  {}:{}", iswap, nrecv[iswap]);
-    }
-    mesg += "\n";
-    utils::logmesg(lmp,mesg);    
+    utils::logmesg_arry(lmp, fmt::format("[info] exchange nlocal {} nrecvc ", atom->nlocal), nrecv, EXCH_SWAP_NUM, 1);
   }
 
   c_vcq = (c_vcq + 1) % VCQ_NUM;
@@ -1492,12 +2926,12 @@ void CommBrick::forward_comm(int) {
   //   c_vcq = (c_vcq + 1) % VCQ_NUM; 
   // }
 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("opt_forward_comm opt_sendnum "), opt_sendnum, opt_maxswap, COMM_STEP); 
-  }
-  if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("opt_forward_comm opt_forward_send_atom "), opt_forward_send_pos, opt_maxswap, COMM_STEP); 
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry(lmp, fmt::format("opt_forward_comm opt_sendnum "), opt_sendnum, opt_maxswap, COMM_STEP); 
+  // }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry(lmp, fmt::format("opt_forward_comm opt_forward_send_atom "), opt_forward_send_pos, opt_maxswap, COMM_STEP); 
+  // }
 
   for (iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
     nbuf_len[iswap] = avec->pack_comm(opt_sendnum[iswap],opt_sendlist[iswap],opt_buf_send[c_vcq][iswap],opt_pbc_flag[iswap],opt_pbc[iswap]);
@@ -1508,13 +2942,13 @@ void CommBrick::forward_comm(int) {
   }
   
 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("opt_forward_comm nbuf_len "), nbuf_len, opt_maxswap, COMM_STEP); 
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry(lmp, fmt::format("opt_forward_comm nbuf_len "), nbuf_len, opt_maxswap, COMM_STEP); 
+  // }
 
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp,"[info] finish forward pack\n");
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg(lmp,"[info] finish forward pack\n");
+  // }
 
   for(iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
     if (nbuf_len[iswap]) {
@@ -1527,24 +2961,24 @@ void CommBrick::forward_comm(int) {
     }
   }
 
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp,"[info] finish forward send\n");
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg(lmp,"[info] finish forward send\n");
+  // }
 
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp,"[info] recv  ");
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg(lmp,"[info] recv  ");
+  // }
   for(iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
     if(opt_size_forward_recv[iswap]) {
       utofu_recv(vcq_hdl_recv[c_vcq][(iswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice); 
-      if(DEBUG_MSG) {
-        utils::logmesg(lmp," {}:{}:{}  ", edata_recv, opt_size_forward_recv[edata_recv]/size_forward, opt_firstrecv[edata_recv]);
-      }
+      // if(DEBUG_MSG) {
+      //   utils::logmesg(lmp," {}:{}:{}  ", edata_recv, opt_size_forward_recv[edata_recv]/size_forward, opt_firstrecv[edata_recv]);
+      // }
     }
   }
-  if(DEBUG_MSG) {
-      utils::logmesg(lmp," \n");
-  }
+  // if(DEBUG_MSG) {
+  //     utils::logmesg(lmp," \n");
+  // }
 
   c_vcq = (c_vcq + 1) % VCQ_NUM;
 }
@@ -1567,9 +3001,9 @@ void CommBrick::reverse_comm()
   //   c_vcq = (c_vcq + 1) % VCQ_NUM; 
   // }
 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry_r(lmp, fmt::format("opt_reverse_comm opt_size_reverse_send "), opt_size_reverse_send, opt_maxswap, COMM_STEP); 
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry_r(lmp, fmt::format("opt_reverse_comm opt_size_reverse_send "), opt_size_reverse_send, opt_maxswap, COMM_STEP); 
+  // }
 
   for (iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
@@ -1580,9 +3014,9 @@ void CommBrick::reverse_comm()
     }
   }
 
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp,"[info] finish reverse send\n");
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg(lmp,"[info] finish reverse send\n");
+  // }
 
   for (iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
@@ -1598,9 +3032,9 @@ void CommBrick::reverse_comm()
     }
   }
 
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp,"[info] reverse recv  ");
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg(lmp,"[info] reverse recv  ");
+  // }
 
   for (iswap = 0; iswap < opt_maxswap; iswap+=COMM_STEP) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
@@ -1608,18 +3042,16 @@ void CommBrick::reverse_comm()
       utofu_recv(vcq_hdl_recv[c_vcq][(rswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice);
       r_edata_recv = edata_recv % 2 == 0 ? edata_recv + 1 : edata_recv - 1;
 
-      if(DEBUG_MSG) utils::logmesg(lmp," {} ", edata_recv);
+      // if(DEBUG_MSG) utils::logmesg(lmp," {} ", edata_recv);
       
       avec->unpack_reverse(opt_sendnum[r_edata_recv],opt_sendlist[r_edata_recv],opt_buf_recv[c_vcq][edata_recv]);
     }
   }
 
-  if(DEBUG_MSG) utils::logmesg(lmp," \n");
+  // if(DEBUG_MSG) utils::logmesg(lmp," \n");
   c_vcq = (c_vcq + 1) % VCQ_NUM;
   
 }
-
-
 
 /* ----------------------------------------------------------------------
    forward communication invoked by a Pair
@@ -1757,6 +3189,7 @@ void CommBrick::reverse_comm(Pair *pair)
   c_vcq = (c_vcq + 1) % VCQ_NUM;
 
 }
+
 void CommBrick::forward_comm_parral(Pair *pair, int tid)
 {
   int iswap;
@@ -2065,189 +3498,195 @@ void CommBrick::reverse_comm(Fix *fix, int size)
 
 }
 
-
-
-void CommBrick::borders_one_parral_sendlist() {
-  int i,n,itype,iswap,dim,ineed, k;  
+void CommBrick::borders_one_parrral(int tid) {
+  int i,n,itype,iswap,dim,ineed, k, rswap;  
   double **x;
   std::string mesg;
+  AtomVec *avec = atom->avec;
+  uint64_t edata_recv, r_edata_recv;
+
+  struct utofu_mrq_notice in_notice;
+  int nbuf_len[SWAP_NUM];
   
   x       = atom->x;
 
-  for(i = 0; i < opt_maxswap; i+=COMM_STEP) {
-    opt_sendnum[i] = 0;
+  if(tid == 11) {
+    for(i = 0; i < opt_maxswap; i+=comm_step) {
+      opt_sendnum[i] = 0;
+    }
+
+    // if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin opt_border local {}\n", atom->nlocal);   
+
+    int ibin;
+    for(i = 0; i < atom->nlocal; i++) {
+      ibin = atom2bin(x[i], bin_split_line);
+
+      for(int j = 0; j < bin2swap_ptr[ibin]; j++) {
+        iswap = bin2swap[ibin][j];
+
+        opt_sendlist[iswap][opt_sendnum[iswap]++] = i;
+        // if(iswap == 0) utils::logmesg(lmp, "[info] opt_sendlist[iswap][opt_sendnum[iswap]++] {} \n", opt_sendlist[iswap][opt_sendnum[iswap]-1]);
+
+        if (opt_sendnum[iswap] == opt_maxsendlist[iswap]) {
+          error->one(FLERR, "sendlist not enough iswap {} opt_sendnum {} maxsendlist {}\n", iswap, opt_sendnum[iswap], opt_maxsendlist[iswap]);
+        }
+      }
+      // for(iswap = 0; iswap < opt_maxswap; iswap+=comm_step) {
+      //   opt_sendlist[iswap][opt_sendnum[iswap]++] = i;
+      // }
+    }
+
+    if(DEBUG_MSG) {
+      utils::logmesg_arry(lmp, fmt::format("[INFO] pack_border sendlist iswap {} ", 0), opt_sendlist[0], opt_sendnum[0], 1); 
+      utils::logmesg_arry(lmp, fmt::format("[INFO] opt_border_one opt_sendnum "), opt_sendnum, opt_maxswap, comm_step); 
+    }
   }
 
-  if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin opt_border local {}\n", atom->nlocal);   
+  lmp->parral_barrier(12, tid);
 
-  int ibin;
-  for(i = 0; i < atom->nlocal; i++) {
-    ibin = atom2bin(x[i], bin_split_line);
+  // if(tid < 6) {
+  if(tid == 11) {
+    for(int tid = 0; tid < 6; tid++) {
 
-    for(int j = 0; j < bin2swap_ptr[ibin]; j++) {
-      iswap = bin2swap[ibin][j];
-      opt_sendlist[iswap][opt_sendnum[iswap]++] = i;
-      if (opt_sendnum[iswap] == opt_maxsendlist[iswap]) {
-        error->one(FLERR, "sendlist not enough iswap {} opt_sendnum {} maxsendlist {}\n", iswap, opt_sendnum[iswap], opt_maxsendlist[iswap]);
+      if(DEBUG_MSG) utils::logmesg(lmp, "[info] begin tid {} \n", tid);
+
+      for(const auto iswap : opt_swap[tid]) {
+        if (opt_sendnum[iswap]*size_border > opt_maxsend[iswap]) {
+          error->one(FLERR, "[info] opt_maxsend not enough  me = {} opt_sendnum {} maxsend {}\n", 
+                                                    me, opt_sendnum[iswap]*size_border, opt_maxsend[iswap]);
+        }
+
+        // if(DEBUG_MSG) utils::logmesg(lmp, "[info] pack tid {} iswap {} num {} addr {} {} {}\n", 
+        //           tid, iswap, opt_sendnum[iswap], (void*)opt_buf_send[c_vcq][iswap], (void*)atom->avec->type, (void*)atom->avec->tag,(void*)atom->avec->mask,(void*)atom->avec->x[0]);
+        nbuf_len[iswap] = 1 + avec->pack_border(opt_sendnum[iswap],opt_sendlist[iswap],opt_buf_send[c_vcq][iswap]+1,opt_pbc_flag[iswap],opt_pbc[iswap]);
+        opt_buf_send[c_vcq][iswap][0] = opt_sendnum[iswap];
+        // if(DEBUG_MSG) utils::logmesg(lmp, "[info] finish pack tid {} iswap {} \n", tid, iswap);
+      }
+
+      if(DEBUG_MSG) {
+        utils::logmesg_arry_parral(lmp, fmt::format("[INFO] opt_border_one nbuf_len tid {} ", tid), nbuf_len, opt_swap[tid]); 
+      }
+
+      for(const auto iswap : opt_swap[tid]) {
+        // if(DEBUG_MSG) utils::logmesg(lmp, "[info] iswap {} opt_stadd_send_offset {} \n", iswap, opt_stadd_send_offset[c_vcq][iswap] - total_buffer_size*sizeof(double));
+        // if(DEBUG_MSG) utils::logmesg(lmp, "[info] iswap {} opt_stadd_recv_offset {} \n", iswap, opt_stadd_recv_offset[c_vcq][iswap] - total_buffer_size*sizeof(double));
+        warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap]+opt_stadd_send_offset[c_vcq][iswap], 
+                rmt_comms[c_vcq][iswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][iswap], sizeof(double) * nbuf_len[iswap], edata[iswap], cbvalue[iswap], post_flags, (void*)opt_buf_send[c_vcq][iswap]);  
+      }
+      for(const auto iswap : opt_swap[tid]) {
+        warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], cbvalue_send[iswap], post_flags);
+      }
+
+      for(const auto iswap : opt_swap[tid]) {
+        utofu_recv(vcq_hdl_recv[c_vcq][(iswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice);
+
+        opt_recvnum[edata_recv] =  opt_buf_recv[c_vcq][edata_recv][0];
+      }
+
+      if(DEBUG_MSG) {
+        utils::logmesg_arry_parral(lmp, fmt::format("[INFO] opt_border_one opt_recvnum tid {} ", tid), opt_recvnum, opt_swap[tid]); 
       }
     }
   }
 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("opt_border_one opt_sendnum "), opt_sendnum, opt_maxswap, COMM_STEP); 
-  }
-};
+  lmp->parral_barrier(12, tid);
 
-void CommBrick::borders_one_parral_xmit(int tid) {
-  int i,n,itype,iswap,dim,ineed, k;  
-  double **x;
-  std::string mesg;
-  
-  AtomVec *avec = atom->avec;
-  uint64_t edata_recv;
+  if(tid == 11) {
+    // MPI_Barrier(world);
 
-  x       = atom->x;
+    c_vcq = (c_vcq + 1) % VCQ_NUM;
 
-  if(DEBUG_MSG) utils::logmesg(lmp, "[info] borders_one_parral_xmit begin cur c_vcq: {} \n", c_vcq);
-
-  struct utofu_mrq_notice in_notice;
-  int nbuf_len[SWAP_NUM];
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    if (opt_sendnum[iswap]*size_border > opt_maxsend[iswap]) {
-      error->one(FLERR, "[info] opt_maxsend not enough  me = {} opt_sendnum {} maxsend {}\n", 
-                                                me, opt_sendnum[iswap]*size_border, opt_maxsend[iswap]);
+    if(DEBUG_MSG) {
+      utils::logmesg(lmp,"[INFO]  opt_borders_one_parral_firstrecv vcq {} \n", c_vcq);
     }
 
-    nbuf_len[iswap] = 1 + avec->pack_border(opt_sendnum[iswap],opt_sendlist[iswap],opt_buf_send[c_vcq][iswap]+1,opt_pbc_flag[iswap],opt_pbc[iswap]);
-    opt_buf_send[c_vcq][iswap][0] = opt_sendnum[iswap];
-  }
-
-  // if(DEBUG_MSG) {
-  //   utils::logmesg_arry_parral(lmp, fmt::format("opt_border_one nbuf_len tid {} ", tid), nbuf_len, opt_maxswap, tid * 2, TNI_NUM * 2); 
-  // }
-
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap], 
-            rmt_comms[c_vcq][iswap].utofu_stadd, sizeof(double) * nbuf_len[iswap], edata[iswap], cbvalue[iswap], post_flags, (void*)opt_buf_send[c_vcq][iswap]);  
-  }
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], cbvalue_send[iswap], post_flags);
-  }
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    warp_utofu_poll_mrq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], edata_send[iswap], post_flags, in_notice);
-  }
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    utofu_recv(vcq_hdl_recv[c_vcq][(iswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice);
-    opt_recvnum[edata_recv] =  opt_buf_recv[c_vcq][edata_recv][0];
-  }
-
-  // if(DEBUG_MSG) {
-  //   utils::logmesg_arry_parral(lmp, fmt::format("opt_border_one opt_recvnum tid {} ", tid), opt_recvnum, opt_maxswap, tid * 2, TNI_NUM * 2); 
-  // }
-};
-
-
-void CommBrick::borders_one_parral_firstrecv() {
-  int i,n,itype,iswap,dim,ineed, k;  
-  double **x;
-  std::string mesg;
-  int rswap;
-
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp," opt_borders_one_parral_firstrecv vcq {} \n", c_vcq);
-  }
-
-  opt_buf_send[c_vcq][1][0] = opt_firstrecv[0] = atom->nlocal;
-  for (iswap = COMM_STEP; iswap + 1 < opt_maxswap; iswap += COMM_STEP) {
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    opt_buf_send[c_vcq][rswap][0] = opt_firstrecv[iswap] = opt_firstrecv[iswap-COMM_STEP] + opt_recvnum[iswap-COMM_STEP];
-  }
- 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("opt_border_one opt_recvnum "),   opt_recvnum, opt_maxswap, COMM_STEP); 
-    utils::logmesg_arry(lmp, fmt::format("opt_border_one opt_firstrecv "), opt_firstrecv, opt_maxswap, COMM_STEP); 
-  }
-};
-
-void CommBrick::borders_one_parral_xmit_pos(int tid) {
-  int i,n,itype,iswap,dim,ineed, k, rswap;  
-  double **x;
-  std::string mesg;
+    opt_buf_send[c_vcq][1][0] = opt_firstrecv[0] = atom->nlocal;
+    for(iswap = comm_step; iswap < opt_maxswap; iswap += comm_step) {
+      rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+      opt_buf_send[c_vcq][rswap][0] = opt_firstrecv[iswap] = opt_firstrecv[iswap-comm_step] + opt_recvnum[iswap-comm_step];
+    }
   
-  AtomVec *avec = atom->avec;
-
-  struct utofu_mrq_notice in_notice;
-  uint64_t edata_recv, r_edata_recv;
-  if(DEBUG_MSG) utils::logmesg(lmp, "[info] borders_one_parral_xmit_pos begin cur c_vcq: {} \n", c_vcq);
-
-
-  // if(DEBUG_MSG) {
-  //   utils::logmesg(lmp,"[info] begin borders_one_parral_xmit_pos tid {}\n", tid);
-  // }
- 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    warp_utofu_put(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], rmt_comms[c_vcq][rswap].vcq_id, lcl_send_stadd[c_vcq][rswap], 
-            rmt_comms[c_vcq][rswap].utofu_stadd, sizeof(double), edata[rswap], cbvalue[rswap], post_flags, (void*)opt_buf_send[c_vcq][rswap]);  
-  }  
-
-  int tmp_vcq = c_vcq - 1 < 0 ? VCQ_NUM - 1 : c_vcq - 1;
-
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    avec->unpack_border(opt_recvnum[iswap], opt_firstrecv[iswap], opt_buf_recv[tmp_vcq][iswap]+1);
+    if(DEBUG_MSG) {
+      utils::logmesg_arry(lmp, fmt::format("opt_border_one opt_recvnum "),   opt_recvnum, opt_maxswap, comm_step); 
+      utils::logmesg_arry(lmp, fmt::format("opt_border_one opt_firstrecv "), opt_firstrecv, opt_maxswap, comm_step); 
+    }
+    
+    // if(DEBUG_MSG) utils::logmesg(lmp, "[info] borders_one_parral_xmit_pos begin cur c_vcq: {} \n", c_vcq);
   }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], cbvalue_send[rswap], post_flags);
-  }
+  lmp->parral_barrier(12, tid);
+
+  if(tid < 6) {
+    // if(DEBUG_MSG) {
+    //   utils::logmesg(lmp,"[info] begin borders_one_parral_xmit_pos tid {}\n", tid);
+    // }
   
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    warp_utofu_poll_mrq(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], edata_send[rswap], post_flags, in_notice);
+    for(const auto iswap : opt_swap[tid]) {
+      rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+      warp_utofu_put(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], rmt_comms[c_vcq][rswap].vcq_id, lcl_send_stadd[c_vcq][rswap]+opt_stadd_send_offset[c_vcq][rswap], 
+              rmt_comms[c_vcq][rswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][rswap], sizeof(double), edata[rswap], cbvalue[rswap], post_flags, (void*)opt_buf_send[c_vcq][rswap]);  
+    }
+
+    int tmp_vcq = c_vcq - 1 < 0 ? VCQ_NUM - 1 : c_vcq - 1;
+
+    for(const auto iswap : opt_swap[tid]) {
+      avec->unpack_border(opt_recvnum[iswap], opt_firstrecv[iswap], opt_buf_recv[tmp_vcq][iswap]+1);
+    }
+
+    for(const auto iswap : opt_swap[tid]) {
+      rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+      warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], cbvalue_send[rswap], post_flags);
+    }
+
+    for(const auto iswap : opt_swap[tid]) {
+      rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+      utofu_recv(vcq_hdl_recv[c_vcq][(rswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice);   
+      r_edata_recv = edata_recv % 2 == 0 ? edata_recv + 1 : edata_recv - 1;
+      opt_forw_pos[r_edata_recv] =  opt_buf_recv[c_vcq][edata_recv][0];
+    }
+
+    if(DEBUG_MSG) {
+      utils::logmesg_arry_parral(lmp, fmt::format("opt_border_one opt_forw_pos tid {} ", tid), opt_forw_pos, opt_swap[tid]); 
+    }
   }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    utofu_recv(vcq_hdl_recv[c_vcq][(rswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice);   
-    r_edata_recv = edata_recv % 2 == 0 ? edata_recv + 1 : edata_recv - 1;
-    opt_forw_pos[r_edata_recv] =  opt_buf_recv[c_vcq][edata_recv][0];
+  lmp->parral_barrier(12, tid);
+
+  if(tid == 11) {
+    c_vcq = (c_vcq + 1) % VCQ_NUM;
+
+    if(DEBUG_MSG) {
+      utils::logmesg(lmp,"[INFO]  opt_borders_one_parral_finish vcq {} comm_step {}  \n", c_vcq, comm_step);
+    }
+
+    for(int iswap = 0; iswap < opt_maxswap; iswap+=comm_step) {
+      rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+      opt_size_forward_recv[iswap] = opt_recvnum[iswap]*size_forward;
+      opt_size_reverse_send[rswap] = opt_recvnum[iswap]*size_reverse;
+      opt_size_reverse_recv[rswap] = opt_sendnum[iswap]*size_reverse;
+      opt_reverse_send_pos[rswap] = opt_firstrecv[iswap]*sizeof(double)*3;
+      opt_forward_send_pos[iswap] = opt_forw_pos[iswap]*sizeof(double)*3;
+      atom->nghost += opt_recvnum[iswap];
+    }
+
+    // if(DEBUG_MSG) {
+    //   utils::logmesg_arry(lmp, fmt::format("borders_parral_finish opt_size_forward_recv "), opt_size_forward_recv, opt_maxswap, COMM_STEP); 
+    //   utils::logmesg_arry_r(lmp, fmt::format("borders_parral_finish opt_size_reverse_send "), opt_size_reverse_send, opt_maxswap, COMM_STEP); 
+    //   utils::logmesg_arry_r(lmp, fmt::format("borders_parral_finish opt_size_reverse_recv "), opt_size_reverse_recv, opt_maxswap, COMM_STEP); 
+    //   utils::logmesg_arry_r(lmp, fmt::format("borders_parral_finish opt_reverse_send_pos "), opt_reverse_send_pos, opt_maxswap, COMM_STEP); 
+    //   utils::logmesg_arry(lmp, fmt::format("borders_parral_finish opt_forward_send_pos "), opt_forward_send_pos, opt_maxswap, COMM_STEP); 
+    // }
+
+    // if(DEBUG_MSG) utils::logmesg(lmp," finish border nlocal {} nghost {} \n",atom->nlocal, atom->nghost);
+    
+    if ((atom->molecular != Atom::ATOMIC)
+        && ((atom->nlocal + atom->nghost) > NEIGHMASK))
+      error->one(FLERR,"Per-processor number of atoms is too large for "
+                "molecular neighbor lists");
   }
 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry_parral(lmp, fmt::format("opt_border_one opt_forw_pos tid {} ", tid), opt_forw_pos, opt_maxswap, tid * 2, TNI_NUM * 2); 
-  }
-};
-
-void CommBrick::borders_one_parral_finish() {
-  int i,n,itype,iswap,dim,ineed, k, rswap;  
-  std::string mesg; 
-
-  for(iswap = 0; iswap < opt_maxswap; iswap += COMM_STEP) {
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    opt_size_forward_recv[iswap] = opt_recvnum[iswap]*size_forward;
-    opt_size_reverse_send[rswap] = opt_recvnum[iswap]*size_reverse;
-    opt_size_reverse_recv[rswap] = opt_sendnum[iswap]*size_reverse;
-    opt_reverse_send_pos[rswap] = opt_firstrecv[iswap]*sizeof(double)*3;
-    opt_forward_send_pos[iswap] = opt_forw_pos[iswap]*sizeof(double)*3;
-    atom->nghost += opt_recvnum[iswap];
-  }
-
-  if(DEBUG_MSG) {
-    utils::logmesg_arry(lmp, fmt::format("borders_parral_finish opt_size_forward_recv "), opt_size_forward_recv, opt_maxswap, COMM_STEP); 
-    utils::logmesg_arry_r(lmp, fmt::format("borders_parral_finish opt_size_reverse_send "), opt_size_reverse_send, opt_maxswap, COMM_STEP); 
-    utils::logmesg_arry_r(lmp, fmt::format("borders_parral_finish opt_size_reverse_recv "), opt_size_reverse_recv, opt_maxswap, COMM_STEP); 
-    utils::logmesg_arry_r(lmp, fmt::format("borders_parral_finish opt_reverse_send_pos "), opt_reverse_send_pos, opt_maxswap, COMM_STEP); 
-    utils::logmesg_arry(lmp, fmt::format("borders_parral_finish opt_forward_send_pos "), opt_forward_send_pos, opt_maxswap, COMM_STEP); 
-  }
-
-  if(DEBUG_MSG) utils::logmesg(lmp," finish border nlocal {} nghost {} \n",atom->nlocal, atom->nghost);
-  
-  if ((atom->molecular != Atom::ATOMIC)
-      && ((atom->nlocal + atom->nghost) > NEIGHMASK))
-    error->one(FLERR,"Per-processor number of atoms is too large for "
-               "molecular neighbor lists");
-};
+  if(DEBUG_MSG) utils::logmesg(lmp,"[INFO] finish border tid  {} \n", tid);
+}
 
 void CommBrick::forward_comm_parral(int tid) {
   int nbuf_len[SWAP_NUM];
@@ -2269,43 +3708,48 @@ void CommBrick::forward_comm_parral(int tid) {
   #endif
 
   if(DEBUG_MSG) {
-    utils::logmesg_arry_parral(lmp, fmt::format("opt_forward_parral opt_sendnum tid {} \n", tid), opt_sendnum, opt_maxswap, tid * 2, TNI_NUM * 2); 
+    utils::logmesg_arry_parral(lmp, fmt::format("opt_forward_parral opt_sendnum tid {} ", tid), opt_sendnum, opt_maxswap, tid * 2, TNI_NUM * 2); 
   }
   // if(DEBUG_MSG) {
   //   utils::logmesg_arry(lmp, fmt::format("opt_forward_comm opt_forward_send_atom "), opt_forward_send_pos, opt_maxswap, COMM_STEP); 
   // }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {  
+  for(const auto iswap : opt_swap[tid]) {
     nbuf_len[iswap] = avec->pack_comm(opt_sendnum[iswap],opt_sendlist[iswap],opt_buf_send[c_vcq][iswap],opt_pbc_flag[iswap],opt_pbc[iswap]);
     if (nbuf_len[iswap]) {
-      warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap], 
+      // opt_buf_send[c_vcq][iswap][nbuf_len[iswap]] = update->ntimestep;
+      // warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap], 
+      //         rmt_comms[c_vcq][iswap].utofu_stadd, (nbuf_len[iswap] + 1) * sizeof(double), edata[iswap], cbvalue[iswap], 0, opt_buf_send[c_vcq][iswap]);  
+
+      warp_utofu_put(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], rmt_comms[c_vcq][iswap].vcq_id, lcl_send_stadd[c_vcq][iswap]+opt_stadd_send_offset[c_vcq][iswap], 
               rmt_comms[c_vcq][iswap].utofu_x_stadd+opt_forward_send_pos[iswap], sizeof(double) * nbuf_len[iswap], edata[iswap], cbvalue[iswap], post_flags, opt_buf_send[c_vcq][iswap]);  
     }
   }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {  
+  for(const auto iswap : opt_swap[tid]) {
     if (nbuf_len[iswap]) {
       warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], cbvalue_send[iswap], post_flags);
     }
   }
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {  
+  for(const auto iswap : opt_swap[tid]) {
     if (nbuf_len[iswap]) {
       warp_utofu_poll_mrq(vcq_hdl_send[c_vcq][(iswap / 2) % TNI_NUM], edata_send[iswap], post_flags, in_notice);
     }
   }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {  
+  for(const auto iswap : opt_swap[tid]) {
     if(opt_size_forward_recv[iswap]) {
       utofu_recv(vcq_hdl_recv[c_vcq][(iswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice); 
       // if(DEBUG_MSG) {
       //   utils::logmesg(lmp," {}:{}:{}  ", edata_recv, opt_size_forward_recv[edata_recv]/size_forward, opt_firstrecv[edata_recv]);
       // }
+      // while(opt_buf_recv[c_vcq][iswap][opt_size_forward_recv[iswap]] != update->ntimestep) ;
+      // memcpy(atom->x[opt_forw_pos[iswap]], opt_buf_recv[c_vcq][iswap], opt_size_forward_recv[iswap] * sizeof(double));
     }
   }
 
-  if(DEBUG_MSG) {
-    utils::logmesg(lmp," opt_forward_parral finish parral tid {} \n", tid);  
-  }
+  if(DEBUG_MSG)  utils::logmesg(lmp," opt_forward_parral finish parral tid {} \n", tid);  
+  
 
   #ifdef THR_TIME_TEST
     td->timer(Timer::FORWARD);
@@ -2327,42 +3771,48 @@ void CommBrick::reverse_comm_parral(int tid) {
     ThrData *td = fixThreadpool->get_thr(tid);
     td->timer(Timer::START);
   #endif
-  if(DEBUG_MSG) {
-    utils::logmesg_arry_parral_r(lmp, fmt::format("opt_reverse_comm_parrel opt_size_reverse_send tid {} ", tid), opt_size_reverse_send, opt_maxswap, tid * 2, TNI_NUM * 2); 
-    utils::logmesg_arry_parral_r(lmp, fmt::format("opt_reverse_comm_parrel opt_size_reverse_recv tid {} ", tid), opt_size_reverse_recv, opt_maxswap, tid * 2, TNI_NUM * 2); 
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry_parral_r(lmp, fmt::format("opt_reverse_comm_parrel opt_size_reverse_send tid {} ", tid), opt_size_reverse_send, opt_maxswap, tid * 2, TNI_NUM * 2); 
+  //   utils::logmesg_arry_parral_r(lmp, fmt::format("opt_reverse_comm_parrel opt_size_reverse_recv tid {} ", tid), opt_size_reverse_recv, opt_maxswap, tid * 2, TNI_NUM * 2); 
+  // }
 
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
+  for(const auto iswap : opt_swap[tid]) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
     if (opt_size_reverse_send[rswap]) {
       warp_utofu_put(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], rmt_comms[c_vcq][rswap].vcq_id, lcl_send_f_stadd[c_vcq][rswap]+opt_reverse_send_pos[rswap],
-                  rmt_comms[c_vcq][rswap].utofu_stadd, sizeof(double) * opt_size_reverse_send[rswap], 
-                  edata[rswap], cbvalue[rswap], post_flags,atom->f[opt_firstrecv[iswap]]);  
+                  rmt_comms[c_vcq][rswap].utofu_stadd+opt_stadd_recv_offset[c_vcq][rswap], sizeof(double) * opt_size_reverse_send[rswap], 
+                  edata[rswap], cbvalue[rswap], post_flags,atom->f[opt_firstrecv[iswap]]);
     }
   }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {
+  for(const auto iswap : opt_swap[tid]) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
     if (opt_size_reverse_send[rswap]) {
       warp_utofu_poll_tcq(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], cbvalue_send[rswap], post_flags);
     }
   }
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {  
-    rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
-    if (opt_size_reverse_send[rswap]) { 
-      warp_utofu_poll_mrq(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], edata_send[rswap], post_flags, in_notice);
-    }
-  }
+  // for(const auto iswap : opt_swap[tid]) {
+  //   rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+  //   if (opt_size_reverse_send[rswap]) {
+  //     warp_utofu_poll_mrq(vcq_hdl_send[c_vcq][(rswap / 2) % TNI_NUM], edata_send[rswap], post_flags, in_notice);
+  //   }
+  // }
 
 
-  for(iswap = tid * 2 ; iswap < opt_maxswap; iswap += TNI_NUM * 2) {  
+  for(const auto iswap : opt_swap[tid]) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
     if (opt_size_reverse_recv[rswap]) { 
       utofu_recv(vcq_hdl_recv[c_vcq][(rswap / 2) % TNI_NUM], edata_recv, post_flags, in_notice);
+
+      r_edata_recv = edata_recv % 2 == 0 ? edata_recv + 1 : edata_recv - 1;
+
+      if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] recv iswap {} sendproc {} i {} ", 
+                edata_recv, opt_sendproc[r_edata_recv], opt_sendlist[r_edata_recv][0]), 
+                opt_buf_recv[c_vcq][edata_recv], (opt_sendnum[r_edata_recv]) * 3, 1);
+
       if(mtx_reverse.try_lock()){
-        r_edata_recv = edata_recv % 2 == 0 ? edata_recv + 1 : edata_recv - 1;
         avec->unpack_reverse(opt_sendnum[r_edata_recv],opt_sendlist[r_edata_recv],opt_buf_recv[c_vcq][edata_recv]);
         remaind_iswap[edata_recv] = 0;
         mtx_reverse.unlock();
@@ -2371,6 +3821,20 @@ void CommBrick::reverse_comm_parral(int tid) {
       }
     }
   }
+
+  // if(tid == 0) {
+  //   if(DEBUG_MSG) {
+  //     auto mesg = fmt::format("[NUMA] reverse_comm_parral ghost force :  \n"); 
+  //     for(iswap = 0 ; iswap < opt_maxswap; iswap += COMM_STEP) {
+  //       mesg += fmt::format("  iswap {}: ", iswap); 
+  //       for(int i = opt_firstrecv[iswap]; i < opt_firstrecv[iswap] + opt_recvnum[iswap]; i++) {
+  //         mesg += fmt::format(" {:<3.3g}:{:<3.3g}:{:<3.3g} |", f[i][0], f[i][1],f[i][2]); 
+  //       }
+  //       mesg += "\n";
+  //     }
+  //     utils::logmesg(lmp,"{}\n", mesg);
+  //   }
+  // }
 
   if(DEBUG_MSG) {
     utils::logmesg(lmp,"[info] finish opt_reverse_comm_parrel send tid {}\n", tid);
@@ -2385,11 +3849,11 @@ void CommBrick::reverse_comm_parral_unpack(){
   int iswap, rswap;
   AtomVec *avec = atom->avec;
 
-  if(DEBUG_MSG) {
-    utils::logmesg_arry_r(lmp, fmt::format("opt_reverse_comm_parral_unpack remaind_iswap "), remaind_iswap, opt_maxswap, COMM_STEP); 
-  }
+  // if(DEBUG_MSG) {
+  //   utils::logmesg_arry_r(lmp, fmt::format("opt_reverse_comm_parral_unpack remaind_iswap "), remaind_iswap, opt_maxswap, COMM_STEP); 
+  // }
 
-  for(iswap = 0 ; iswap < opt_maxswap; iswap += COMM_STEP) {
+  for(iswap = 0 ; iswap < opt_maxswap; iswap += comm_step) {
     rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
     if (opt_size_reverse_recv[rswap]) {
       if(remaind_iswap[rswap]){
@@ -3072,9 +4536,6 @@ void CommBrick::reverse_comm(Bond *bond)
     bond->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
   }
 }
-
-
-
 
 /* ----------------------------------------------------------------------
    reverse communication invoked by a Fix with variable size data

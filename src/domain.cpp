@@ -336,8 +336,8 @@ void Domain::set_local_box()
 {
   if (triclinic) return;
 
+  int *myloc = comm->myloc;
   if (comm->layout != Comm::LAYOUT_TILED) {
-    int *myloc = comm->myloc;
     int *procgrid = comm->procgrid;
     double *xsplit = comm->xsplit;
     double *ysplit = comm->ysplit;
@@ -354,6 +354,25 @@ void Domain::set_local_box()
     sublo[2] = boxlo[2] + zprd*zsplit[myloc[2]];
     if (myloc[2] < procgrid[2]-1) subhi[2] = boxlo[2] + zprd*zsplit[myloc[2]+1];
     else subhi[2] = boxhi[2];
+
+    
+    // double nusublo_all[NUMA_NUM][3], nusubhi_all[NUMA_NUM][3];
+
+      // MPI_Allreduce(&sublo[i], &nusublo[i], 1, MPI_DOUBLE, MPI_MIN, comm->nuworld);
+      // MPI_Allreduce(&subhi[i], &nusubhi[i], 1, MPI_DOUBLE, MPI_MAX, comm->nuworld);
+    // MPI_Allgather(sublo,3,MPI_DOUBLE,nusublo_all[0],3,MPI_DOUBLE,comm->nuworld);
+    // MPI_Allgather(subhi,3,MPI_DOUBLE,nusubhi_all[0],3,MPI_DOUBLE,comm->nuworld);
+
+    // for(int i = 0; i < 3; i++) {
+    //   nusublo[i] = MIN(nusublo_all[comm->numa_group_id[0]][i],nusublo_all[comm->numa_group_id[1]][i] );
+    //   nusubhi[i] = MAX(nusubhi_all[comm->numa_group_id[0]][i],nusubhi_all[comm->numa_group_id[1]][i] );
+    // }
+
+    for(int i = 0; i < 3; i++) {
+      MPI_Allreduce(&sublo[i], &nusublo[i], 1, MPI_DOUBLE, MPI_MIN, comm->nuworld);
+      MPI_Allreduce(&subhi[i], &nusubhi[i], 1, MPI_DOUBLE, MPI_MAX, comm->nuworld);
+    }
+
 
   } else {
     double (*mysplit)[2] = comm->mysplit;
@@ -375,15 +394,29 @@ void Domain::set_local_box()
   lcl_prd[0] = lcl_xprd = subhi[0] - sublo[0];
   lcl_prd[1] = lcl_yprd = subhi[1] - sublo[1];
   lcl_prd[2] = lcl_zprd = subhi[2] - sublo[2];
+
+  for(int i = 0; i < 3; i++) {
+    lcl_nuprd[i] = nusubhi[i] - nusublo[i];
+  }
   
-  // if(DEBUG_MSG) {
-  //   auto mesg = fmt::format("[info] subboder split "); 
-  //   for(int i = 0; i < 3; i++) {
-  //     mesg += fmt::format("  {}:{} ", sublo[i], subhi[i]);
-  //   }
-  //   mesg += "\n";
-  //   utils::logmesg(lmp,mesg);
-  // }
+  if(DEBUG_MSG) {
+    auto mesg = fmt::format("[info] subboder split "); 
+    for(int i = 0; i < 3; i++) {
+      mesg += fmt::format("  {}:{} ", sublo[i], subhi[i]);
+    }
+    mesg += "\n";
+    mesg += fmt::format("[NUMA] numa_border "); 
+    for(int i = 0; i < 3; i++) {
+      mesg += fmt::format("  {}:{} ", nusublo[i], nusubhi[i]);
+    }
+    mesg += "\n";
+    mesg += fmt::format("[NUMA] my loc "); 
+    for(int i = 0; i < 3; i++) {
+      mesg += fmt::format(" {} ", myloc[i]);
+    }
+    mesg += "\n";
+    utils::logmesg(lmp,mesg);
+  }
 
 }
 
@@ -544,6 +577,9 @@ void Domain::reset_box()
 
 void Domain::pbc()
 {
+
+  if(DEBUG_MSG) utils::logmesg(lmp, "[NUMA] Domain::pbc \n"); 
+
   int nlocal = atom->nlocal;
   if (!nlocal) return;
   int i;

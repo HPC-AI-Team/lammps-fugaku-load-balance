@@ -12,6 +12,8 @@
 ------------------------------------------------------------------------- */
 
 #include "nstencil_full_bin_3d.h"
+#include "utils.h"
+#include "comm.h"
 
 using namespace LAMMPS_NS;
 
@@ -34,4 +36,16 @@ void NStencilFullBin3d::create()
       for (i = -sx; i <= sx; i++)
         if (bin_distance(i, j, k) < cutneighmaxsq)
           stencil[nstencil++] = k * mbiny * mbinx + j * mbinx + i;
+
+  nunstencil = 0;
+
+  for (k = -sz; k <= sz; k++)
+    for (j = -sy; j <= sy; j++)
+      for (i = -sx; i <= sx; i++)
+          if (bin_distance(i, j, k) < cutneighmaxsq){
+            nustencil[nunstencil++] = k * numbiny * numbinx + j * numbinx + i;
+          }
+
+  if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] nustencil "),  nustencil, nunstencil, 1);
+  
 }

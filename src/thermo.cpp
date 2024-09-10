@@ -400,10 +400,10 @@ void Thermo::compute(int flag)
     if (flag)
       cpu = timer->elapsed(Timer::TOTAL);
     else
-      cpu = 0.0;
+      cpu = 0.0;    
     line += fmt::format(FORMAT_MULTI_HEADER, ntimestep, cpu);
   }
-
+  line += fmt::format("thermo_output: ");
   // add each thermo value to line with its specific format
 
   for (ifield = 0; ifield < nfield; ifield++) {
@@ -1771,7 +1771,7 @@ void Thermo::compute_epair()
   double tmp = 0.0;
   if (force->pair) tmp += force->pair->eng_vdwl + force->pair->eng_coul;
   MPI_Allreduce(&tmp, &dvalue, 1, MPI_DOUBLE, MPI_SUM, world);
-
+  
   if (force->kspace) dvalue += force->kspace->energy;
   if (force->pair && force->pair->tail_flag) {
     double volume = domain->xprd * domain->yprd * domain->zprd;

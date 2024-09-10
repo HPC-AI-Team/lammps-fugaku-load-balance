@@ -302,13 +302,13 @@ Atom::~Atom()
   memory->destroy(next);
   memory->destroy(permute);
 
-  memory->destroy(tag);
-  memory->destroy(type);
-  memory->destroy(mask);
-  memory->destroy(image);
-  memory->destroy(x);
-  memory->destroy(v);
-  memory->destroy(f);
+  // memory->destroy(tag);
+  // memory->destroy(type);
+  // memory->destroy(mask);
+  // memory->destroy(image);
+  // memory->destroy(x);
+  // memory->destroy(v);
+  // memory->destroy(f);
 
   // delete custom atom arrays
 

@@ -91,6 +91,32 @@ namespace utils {
    tmp += "[info]" + mesg;
    for(int i = 0; i < n ;i += step) {
       tmp += fmt::format("  {}:{}", i, n_array[i]);
+      if(i != 0 && (i % 100 == 0)) tmp += "\n      ";
+   }
+   tmp += "\n";
+   logmesg(lmp, tmp);
+  }
+
+   template <typename TYPE> void logmesg_arry_singleline(LAMMPS *lmp, const std::string &mesg, TYPE *n_array, int n, int step)
+  {
+   std::string tmp;
+   tmp += "[info]" + mesg;
+   logmesg(lmp, tmp);
+
+   for(int i = 0; i < n ;i += step) {
+      tmp = fmt::format(" {} \n", n_array[i]);
+      logmesg(lmp, tmp);
+   }
+  }
+
+   template <typename TYPE> void logmesg_arry_x(LAMMPS *lmp, const std::string &mesg, TYPE *n_array, int n, int step)
+  {
+   std::string tmp;
+   tmp += "[info]" + mesg + "\n      ";
+   for(int i = 0; i < n ;i += step * 3) {
+      tmp += fmt::format(" ({}: {:<3.9f},{:<3.9f},{:<3.9f})", i / 3, n_array[i], n_array[i+1],n_array[i+2]);
+      // tmp += fmt::format(" ({}: {},{},{})", i / 3, n_array[i], n_array[i+1],n_array[i+2]);
+      if(i != 0 && (i % 100 == 0)) tmp += "\n      ";
    }
    tmp += "\n";
    logmesg(lmp, tmp);
@@ -118,12 +144,34 @@ namespace utils {
    tmp += "\n";
    logmesg(lmp, tmp);
   }
+
+    template <typename TYPE> void logmesg_arry_parral(LAMMPS *lmp, const std::string &mesg, TYPE *n_array, std::vector<int> &swaps)
+  {
+   std::string tmp;
+   tmp += mesg;
+   for(auto &iswap : swaps) {
+      tmp += fmt::format("  {}:{}", iswap, n_array[iswap]);
+   }
+   tmp += "\n";
+   logmesg(lmp, tmp);
+  }
    template <typename TYPE> void logmesg_arry_parral_r(LAMMPS *lmp, const std::string &mesg, TYPE *n_array, int n, int nstart, int step)
   {
    std::string tmp;
    tmp += "[info]" + mesg;
    for(int i = nstart; i < n ;i += step) {
       tmp += fmt::format("  {}:{}", i + 1, n_array[i + 1]);
+   }
+   tmp += "\n";
+   logmesg(lmp, tmp);
+  }
+   template <typename TYPE> void logmesg_arry_parral_r(LAMMPS *lmp, const std::string &mesg, TYPE *n_array, std::vector<int> &swaps)
+  {
+   std::string tmp;
+   tmp += "[info]" + mesg;
+   for(auto &iswap : swaps) {
+      int rswap = (iswap % 2 == 0) ? iswap + 1 : iswap - 1;
+      tmp += fmt::format("  {}:{}", rswap, n_array[rswap]);
    }
    tmp += "\n";
    logmesg(lmp, tmp);

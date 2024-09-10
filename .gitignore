@@ -31,6 +31,21 @@ vgcore.*
 .#*
 .vscode
 
+/lmp_*
+
+lmp_execute
+lmp_threadpool
+
+compile.log
+
+*.err
+*.out
+*.stats
+stderr.*
+stdout.1.[1-9]*
+stdout.1.0
+output/
+
 .DS_Store
 .DS_Store?
 ._*

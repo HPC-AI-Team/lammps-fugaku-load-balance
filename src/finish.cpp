@@ -31,7 +31,7 @@
 #include "timer.h"              // IWYU pragma: keep
 #include "universe.h"
 #include "update.h"
-
+#include "deepmd_util.h"
 #include <cmath>
 #include <cstring>
 
@@ -339,6 +339,144 @@ void Finish::end(int flag)
     mpi_timings("Comm",timer,Timer::COMM,world,nprocs,nthreads,me,time_loop,screen,logfile);
     mpi_timings("Output",timer,Timer::OUTPUT,world,nprocs,nthreads,me,time_loop,screen,logfile);
     mpi_timings("Modify",timer,Timer::MODIFY,world,nprocs,nthreads,me,time_loop,screen,logfile);
+
+    // mpi_timings("PAIR_OPT",self_timer,Timer::PAIR_OPT,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("PAIR_NUMA",self_timer,Timer::PAIR_NUMA,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("BOARDER",self_timer,Timer::BOARDER,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("BOARDER_NUMA",self_timer,Timer::BOARDER_NUMA,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("EXCANGE",self_timer,Timer::EXCANGE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("EXCANGE_NUMA",self_timer,Timer::EXCANGE_NUMA,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("FORWARD",self_timer,Timer::FORWARD,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("FORWARD_NUMA",self_timer,Timer::FORWARD_NUMA,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("REVERSE",self_timer,Timer::REVERSE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("REVERSE_NUMA",self_timer,Timer::REVERSE_NUMA,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("FIX_INIT",self_timer,Timer::FIX_INIT,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("FIX_FINAL",self_timer,Timer::FIX_FINAL,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("REVERSE_CPY",self_timer,Timer::REVERSE_CPY,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("REVERSE_COMM",self_timer,Timer::REVERSE_COMM,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("REVERSE_REDUCE",self_timer,Timer::REVERSE_REDUCE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("FORWARD_CPY",self_timer,Timer::FORWARD_CPY,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("FORWARD_COMM",self_timer,Timer::FORWARD_COMM,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("FORWARD_PBC",self_timer,Timer::FORWARD_PBC,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("BARRIER_FW_0",self_timer,Timer::BARRIER_FW_0,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    // mpi_timings("BARRIER_FW_1",self_timer,Timer::BARRIER_FW_1,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("BARRIER_RD_0",self_timer,Timer::BARRIER_RD_0,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("BARRIER_RD_1",self_timer,Timer::BARRIER_RD_1,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("BARRIER_PA_0",self_timer,Timer::BARRIER_PA_0,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("BARRIER_PA_1",self_timer,Timer::BARRIER_PA_1,world,nprocs,nthreads,me,time_loop,screen,logfile);
+
+
+
+    // double tc[100], tw[100];
+    // for(int ii = Timer::PREPARE; ii <= Timer::MATMUL_2D_3; ii++) {
+    //   tc[ii] = 0.0; tw[ii] = 0.0;
+    //   for(int jj = 0; jj < comm->nthreads; jj++) {
+    //     if(tc[ii] < lmp->deep_pots[jj]->t_timer->cpu_array[ii]) tc[ii] = lmp->deep_pots[jj]->t_timer->cpu_array[ii];
+    //     if(tw[ii] < lmp->deep_pots[jj]->t_timer->wall_array[ii]) tw[ii] = lmp->deep_pots[jj]->t_timer->wall_array[ii];
+    //   }
+    // }
+    // for(int ii = Timer::PREPARE; ii <= Timer::MATMUL_2D_3; ii++) {
+    //   self_timer->cpu_array[ii] = tc[ii]; self_timer->wall_array[ii] = tw[ii];
+    // }
+
+    mpi_timings("PREPARE",self_timer,Timer::PREPARE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("DO_NEIGHBOR",self_timer,Timer::DO_NEIGHBOR,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("PROD_ENV",self_timer,Timer::PROD_ENV,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("TABULATE",self_timer,Timer::TABULATE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("EM_SLICE",self_timer,Timer::EM_SLICE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("EM_MUT_3D",self_timer,Timer::EM_MUT_3D,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("FIT_CAST",self_timer,Timer::FIT_CAST,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("TABULATE_GRAD",self_timer,Timer::TABULATE_GRAD,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("PROD_FV",self_timer,Timer::PROD_FV,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_ADD_0",self_timer,Timer::MATMUL_ADD_0,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_ADD_1",self_timer,Timer::MATMUL_ADD_1,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_ADD_2",self_timer,Timer::MATMUL_ADD_2,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_ADD_3",self_timer,Timer::MATMUL_ADD_3,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("FAST_TANH",self_timer,Timer::FAST_TANH,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("FAST_TANH_GRAD",self_timer,Timer::FAST_TANH_GRAD,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("IDT_MULT",self_timer,Timer::IDT_MULT,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("IDT_MULT_GRAD",self_timer,Timer::IDT_MULT_GRAD,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATRIX_ADD",self_timer,Timer::MATRIX_ADD,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_3D",self_timer,Timer::MATMUL_3D,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("FIT_SLICE",self_timer,Timer::FIT_SLICE,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_2D_0",self_timer,Timer::MATMUL_2D_0,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_2D_1",self_timer,Timer::MATMUL_2D_1,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_2D_2",self_timer,Timer::MATMUL_2D_2,world,nprocs,nthreads,me,time_loop,screen,logfile);
+    mpi_timings("MATMUL_2D_3",self_timer,Timer::MATMUL_2D_3,world,nprocs,nthreads,me,time_loop,screen,logfile);
+
+
+    // if(DEBUG_MSG) {
+    // int max_rank;
+    // double *all_times = new double[nprocs], reduce_time;
+    // double _time;
+    // _time = timer->get_wall(Timer::PAIR);
+    // MPI_Allgather(&_time,1,MPI_DOUBLE,all_times,1,MPI_DOUBLE,world);
+    // // if(me == 0) utils::logmesg_arry(lmp, "[INFO] Pair time n", all_times, nprocs, 1);
+    // if(me == 0) utils::logmesg_arry_singleline(lmp, "[INFO] Pair time n", all_times, nprocs, 1);
+
+    // max_rank = 0; _time = all_times[0];
+    // for(int i = 0; i < nprocs; i++) {
+    //   if(all_times[i] > _time) {_time = all_times[i]; max_rank = i;}
+    // }
+    // if(me == 0) utils::logmesg(lmp, "[INFO] max Pair time rank {} time {} \n", max_rank, _time);
+
+    // _time = self_timer->get_wall(Timer::MATMUL_2D_3);
+    // MPI_Allgather(&_time,1,MPI_DOUBLE,all_times,1,MPI_DOUBLE,world);
+    // max_rank = 0; _time = all_times[0];
+    // for(int i = 0; i < nprocs; i++) {
+    //   if(all_times[i] > _time) {_time = all_times[i]; max_rank = i;}
+    // }
+    // if(me == 0) utils::logmesg(lmp, "[INFO] max MATMUL_2D_3 rank {} time {} \n", max_rank, _time);
+    
+    // _time = self_timer->get_wall(Timer::MATMUL_ADD_0);
+    // MPI_Allgather(&_time,1,MPI_DOUBLE,all_times,1,MPI_DOUBLE,world);
+    // max_rank = 0; _time = all_times[0];
+    // for(int i = 0; i < nprocs; i++) {
+    //   if(all_times[i] > _time) {_time = all_times[i]; max_rank = i;}
+    // }
+    // if(me == 0) utils::logmesg(lmp, "[INFO] max MATMUL_ADD_0 rank {} time {} \n", max_rank, _time);
+
+
+    // for(int i = 0; i < T_THREAD; i++) {
+    //   all_times[i] = lmp->deep_pots[i]->t_timer->wall_array[Timer::MATMUL_2D_3];
+    // }
+    // utils::logmesg_arry(lmp, "[INFO] thread Timer::MATMUL_2D_3 ", all_times, T_THREAD, 1);
+    // for(int i = 0; i < T_THREAD; i++) {
+    //   all_times[i] = lmp->deep_pots[i]->t_timer->wall_array[Timer::PROD_ENV];
+    // }
+    // utils::logmesg_arry(lmp, "[INFO] thread Timer::PROD_ENV ", all_times, T_THREAD, 1);
+    // for(int i = 0; i < T_THREAD; i++) {
+    //   all_times[i] = lmp->deep_pots[i]->t_timer->wall_array[Timer::MATMUL_ADD_0];
+    // }
+    // utils::logmesg_arry(lmp, "[INFO] thread Timer::MATMUL_ADD_0 ", all_times, T_THREAD, 1);
+    // for(int i = 0; i < T_THREAD; i++) {
+    //   all_times[i] = lmp->deep_pots[i]->t_timer->wall_array[Timer::TABULATE_GRAD];
+    // }
+    // utils::logmesg_arry(lmp, "[INFO] thread Timer::TABULATE_GRAD ", all_times, T_THREAD, 1);
+  
+
+    // int *all_atoms = new int[nprocs];
+    // MPI_Allgather(&atom->nlocal,1,MPI_INT,all_atoms,1,MPI_INT,world);
+    // // if(me == 0) utils::logmesg_arry(lmp, "[INFO] nlocal n", all_atoms, nprocs, 1);
+    // if(me == 0) utils::logmesg_arry_singleline(lmp, "[INFO] nlocal n", all_atoms, nprocs, 1);
+
+    // MPI_Allgather(&comm->pair_len,1,MPI_INT,all_atoms,1,MPI_INT,world);
+    // // if(me == 0) utils::logmesg_arry(lmp, "[INFO] lb_atom n", all_atoms, nprocs, 1);
+    // if(me == 0) utils::logmesg_arry_singleline(lmp, "[INFO] lb_atom n", all_atoms, nprocs, 1);
+
+    // int max_atom;
+    // max_rank = 0; max_atom = all_atoms[0];
+    // for(int i = 0; i < nprocs; i++) {
+    //   if(all_atoms[i] > max_atom) {max_atom = all_atoms[i]; max_rank = i;}
+    // }
+    // if(me == 0) utils::logmesg(lmp, "[INFO]] max atom rank {} atomnum {} \n", max_rank, max_atom);
+
+
+
+    // _time = self_timer->get_wall(Timer::BARRIER_PA_1);
+    // MPI_Allgather(&_time,1,MPI_DOUBLE,all_times,1,MPI_DOUBLE,world);
+    // if(me == 0) utils::logmesg_arry(lmp, "[INFO] BARRIER_PA_1 time n", all_times, nprocs, 1);
+
     if (timer->has_sync())
       mpi_timings("Sync",timer,Timer::SYNC,world,nprocs,nthreads,me,time_loop,screen,logfile);
 
@@ -452,98 +590,99 @@ void Finish::end(int flag)
                      time3d,fraction,flop3,flop1);
   }
 
-  nneigh = nneighfull = 0;
-  if (histoflag) {
-    std::string mesg = "\n";
-    tmp = atom->nlocal;
-    stats(1,&tmp,&ave,&max,&min,10,histo);
-    if (me == 0) {
-      mesg += fmt::format("Nlocal:    {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
-      mesg += "Histogram:";
-      for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
-      mesg += "\n";
-    }
+  // nneigh = nneighfull = 0;
+  // if (histoflag) {
+  //   std::string mesg = "\n";
+  //   // tmp = atom->nlocal;
+  //   tmp = comm->pair_len;
+  //   stats(1,&tmp,&ave,&max,&min,10,histo);
+  //   if (me == 0) {
+  //     mesg += fmt::format("Nlocal:    {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
+  //     mesg += "Histogram:";
+  //     for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
+  //     mesg += "\n";
+  //   }
 
-    tmp = atom->nghost;
-    stats(1,&tmp,&ave,&max,&min,10,histo);
-    if (me == 0) {
-      mesg += fmt::format("Nghost:    {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
-      mesg += "Histogram:";
-      for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
-      mesg += "\n";
-    }
+  //   tmp = atom->nghost;
+  //   stats(1,&tmp,&ave,&max,&min,10,histo);
+  //   if (me == 0) {
+  //     mesg += fmt::format("Nghost:    {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
+  //     mesg += "Histogram:";
+  //     for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
+  //     mesg += "\n";
+  //   }
 
-    tmp = nneigh = neighbor->get_nneigh_half();
-    if (tmp < 0.0) tmp = 0.0;
-    stats(1,&tmp,&ave,&max,&min,10,histo);
-    if (me == 0) {
-      mesg += fmt::format("Neighs:    {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
-      mesg += "Histogram:";
-      for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
-      mesg += "\n";
-    }
+  //   tmp = nneigh = neighbor->get_nneigh_half();
+  //   if (tmp < 0.0) tmp = 0.0;
+  //   stats(1,&tmp,&ave,&max,&min,10,histo);
+  //   if (me == 0) {
+  //     mesg += fmt::format("Neighs:    {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
+  //     mesg += "Histogram:";
+  //     for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
+  //     mesg += "\n";
+  //   }
 
-    tmp = nneighfull = neighbor->get_nneigh_full();
-    if (tmp >= 0.0) {
-      stats(1,&tmp,&ave,&max,&min,10,histo);
-      if (me == 0) {
-        mesg += fmt::format("FullNghs:  {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
-        mesg += "Histogram:";
-        for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
-        mesg += "\n";
-      }
-    }
-    if (me == 0) utils::logmesg(lmp,mesg);
-  }
+  //   tmp = nneighfull = neighbor->get_nneigh_full();
+  //   if (tmp >= 0.0) {
+  //     stats(1,&tmp,&ave,&max,&min,10,histo);
+  //     if (me == 0) {
+  //       mesg += fmt::format("FullNghs:  {:11.6} ave {:11.6g} max {:11.6g} min\n",ave,max,min);
+  //       mesg += "Histogram:";
+  //       for (i = 0; i < 10; i++) mesg += fmt::format(" {}",histo[i]);
+  //       mesg += "\n";
+  //     }
+  //   }
+  //   if (me == 0) utils::logmesg(lmp,mesg);
+  // }
 
-  if (neighflag) {
-    if (me == 0) utils::logmesg(lmp,"\n");
+  // if (neighflag) {
+  //   if (me == 0) utils::logmesg(lmp,"\n");
 
-    tmp = MAX(MAX(nneigh,nneighfull),0.0);
-    double nall;
-    MPI_Allreduce(&tmp,&nall,1,MPI_DOUBLE,MPI_SUM,world);
+  //   tmp = MAX(MAX(nneigh,nneighfull),0.0);
+  //   double nall;
+  //   MPI_Allreduce(&tmp,&nall,1,MPI_DOUBLE,MPI_SUM,world);
 
-    int nspec;
-    double nspec_all = 0;
-    if (atom->molecular == Atom::MOLECULAR) {
-      int **nspecial = atom->nspecial;
-      int nlocal = atom->nlocal;
-      nspec = 0;
-      for (i = 0; i < nlocal; i++) nspec += nspecial[i][2];
-      tmp = nspec;
-      MPI_Allreduce(&tmp,&nspec_all,1,MPI_DOUBLE,MPI_SUM,world);
-    } else if (atom->molecular == Atom::TEMPLATE) {
-      Molecule **onemols = atom->avec->onemols;
-      int *molindex = atom->molindex;
-      int *molatom = atom->molatom;
-      int nlocal = atom->nlocal;
-      int imol,iatom;
-      nspec = 0;
-      for (i = 0; i < nlocal; i++) {
-        if (molindex[i] < 0) continue;
-        imol = molindex[i];
-        iatom = molatom[i];
-        nspec += onemols[imol]->nspecial[iatom][2];
-      }
-      tmp = nspec;
-      MPI_Allreduce(&tmp,&nspec_all,1,MPI_DOUBLE,MPI_SUM,world);
-    }
+  //   int nspec;
+  //   double nspec_all = 0;
+  //   if (atom->molecular == Atom::MOLECULAR) {
+  //     int **nspecial = atom->nspecial;
+  //     int nlocal = atom->nlocal;
+  //     nspec = 0;
+  //     for (i = 0; i < nlocal; i++) nspec += nspecial[i][2];
+  //     tmp = nspec;
+  //     MPI_Allreduce(&tmp,&nspec_all,1,MPI_DOUBLE,MPI_SUM,world);
+  //   } else if (atom->molecular == Atom::TEMPLATE) {
+  //     Molecule **onemols = atom->avec->onemols;
+  //     int *molindex = atom->molindex;
+  //     int *molatom = atom->molatom;
+  //     int nlocal = atom->nlocal;
+  //     int imol,iatom;
+  //     nspec = 0;
+  //     for (i = 0; i < nlocal; i++) {
+  //       if (molindex[i] < 0) continue;
+  //       imol = molindex[i];
+  //       iatom = molatom[i];
+  //       nspec += onemols[imol]->nspecial[iatom][2];
+  //     }
+  //     tmp = nspec;
+  //     MPI_Allreduce(&tmp,&nspec_all,1,MPI_DOUBLE,MPI_SUM,world);
+  //   }
 
-    if (me == 0) {
-      std::string mesg;
+  //   if (me == 0) {
+  //     std::string mesg;
 
-      mesg += fmt::format("Total # of neighbors = {:.8g}\n",nall);
-      if (atom->natoms > 0)
-        mesg += fmt::format("Ave neighs/atom = {:.8}\n",nall/atom->natoms);
-      if ((atom->molecular != Atom::ATOMIC) && (atom->natoms > 0))
-        mesg += fmt::format("Ave special neighs/atom = {:.8}\n",nspec_all/atom->natoms);
-      mesg += fmt::format("Neighbor list builds = {}\n",neighbor->ncalls);
-      if (neighbor->dist_check)
-        mesg += fmt::format("Dangerous builds = {}\n",neighbor->ndanger);
-      else mesg += "Dangerous builds not checked\n";
-      utils::logmesg(lmp,mesg);
-    }
-  }
+  //     mesg += fmt::format("Total # of neighbors = {:.8g}\n",nall);
+  //     if (atom->natoms > 0)
+  //       mesg += fmt::format("Ave neighs/atom = {:.8}\n",nall/atom->natoms);
+  //     if ((atom->molecular != Atom::ATOMIC) && (atom->natoms > 0))
+  //       mesg += fmt::format("Ave special neighs/atom = {:.8}\n",nspec_all/atom->natoms);
+  //     mesg += fmt::format("Neighbor list builds = {}\n",neighbor->ncalls);
+  //     if (neighbor->dist_check)
+  //       mesg += fmt::format("Dangerous builds = {}\n",neighbor->ndanger);
+  //     else mesg += "Dangerous builds not checked\n";
+  //     utils::logmesg(lmp,mesg);
+  //   }
+  // }
 
   if (logfile) fflush(logfile);
 }
@@ -630,11 +769,11 @@ void mpi_timings(const char *label, Timer *t, enum Timer::ttype tt,
     tmp = time/time_loop*100.0;
     std::string mesg;
     if (t->has_full())
-      mesg = fmt::format("{:<8s}| {:<10.5g} | {:<10.5g} | {:<10.5g} |{:6.1f} |"
+      mesg = fmt::format("{:<16s}| {:<10.5g} | {:<10.5g} | {:<10.5g} |{:6.1f} |"
                          "{:6.1f} |{:6.2f}\n",
                          label,time_min,time,time_max,time_sq,time_cpu,tmp);
     else
-      mesg = fmt::format("{:<8s}| {:<10.5g} | {:<10.5g} | {:<10.5g} |{:6.1f} |"
+      mesg = fmt::format("{:<16s}| {:<10.5g} | {:<10.5g} | {:<10.5g} |{:6.1f} |"
                          "{:6.2f}\n",label,time_min,time,time_max,time_sq,tmp);
     if (scr) fputs(mesg.c_str(),scr);
     if (log) fputs(mesg.c_str(),log);

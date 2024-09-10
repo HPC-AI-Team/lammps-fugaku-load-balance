@@ -75,6 +75,7 @@ void Verlet::init()
   // detect if fix omp is present for clearing force arrays
 
   if (modify->get_fix_by_id("package_omp")) external_force_clear = 1;
+  if (comm->thread_pool_flag) external_force_clear = 1;
 
   // set flags for arrays to clear in force_clear()
 
@@ -114,6 +115,7 @@ void Verlet::setup(int flag)
   // acquire ghosts
   // build neighbor lists
 
+
   atom->setup();
   modify->setup_pre_exchange();
   if (triclinic) domain->x2lamda(atom->nlocal);
@@ -122,33 +124,63 @@ void Verlet::setup(int flag)
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin comm->setup()\n");
 
   if(!comm->utofu_init_flag){
-    comm->setup();
+    atom->avec->determin_max();
 
-    atom->avec->grow(0);
+    comm->setup();
     if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish comm->setup()\n");
 
-    comm->utofu_init();
-  }
+    atom->avec->grow_init();
+    if(comm->numa_flag) {
+      comm->numa_shm_init();
+    }
+    if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish comm->numa_shm_init()\n");
+
+    comm->utofu_init_opt();
+    if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish comm->utofu_init_opt()\n");
+  }  
+
+  if(DEBUG_MSG) utils::logmesg_arry_x(lmp, fmt::format("[NUMA] origin atom->x {}", (void*)atom->x[0]), atom->x[0], (atom->nlocal + atom->nghost) * 3, 1); 
 
   if (neighbor->style) neighbor->setup_bins();
-  comm->exchange();
-  if (atom->sortfreq > 0) atom->sort();
-  if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin opt_border\n");  
+  if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish comm->setup_bins()\n");
+  
+  comm->exchange();   
+  // if (atom->sortfreq > 0) atom->sort();
+  if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish comm->exchange\n");  
 
-  if(comm->thread_pool_flag)
-    lmp->execute(LAMMPS::BORDER_XMIT);
-  else
-    comm->borders();
+  if(comm->numa_flag) {
+    lmp->execute(LAMMPS::BORDER_NUMA);  
+  } else {
+    if(comm->thread_pool_flag)
+      lmp->execute(LAMMPS::BORDER_COMBINE);
+    else
+      comm->borders();
+  }
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish comm->border barrier\n");
+
+
+  // MPI_Barrier(world);  
+  // MPI_Finalize();
+  // exit(0);
+
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish opt_border nlocal {} nghost {} \n", atom->nlocal, atom->nghost);    
+  if(DEBUG_MSG) utils::logmesg_arry_x(lmp, fmt::format("[NUMA] border atom->x {}", (void*)atom->x[0]), atom->x[0], (atom->nlocal + atom->nghost) * 3, 1); 
 
+  if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] atom->type "),  atom->type, atom->nlocal + atom->nghost, 1);
+  
+  if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[INFO] comm->pair_index "),  comm->pair_index, comm->pair_len, 1);
+  
   if (triclinic) domain->lamda2x(atom->nlocal+atom->nghost);
   domain->image_check();
   domain->box_too_small_check();
   modify->setup_pre_neighbor();
   neighbor->build(1);
-  modify->setup_post_neighbor();
-  neighbor->ncalls = 0;
+  if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish neighbor build\n");  
 
+  modify->setup_post_neighbor();
+  neighbor->ncalls = 0;  
+  
   // compute all forces
 
   force->setup();
@@ -158,7 +190,6 @@ void Verlet::setup(int flag)
 
   force->threadpool_eflag = eflag;
   force->threadpool_vflag = vflag;
-  if(DEBUG_MSG) utils::logmesg(lmp,"[info] beign  force_clear\n");
 
   force_clear();
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin setup_pre_force\n");
@@ -170,7 +201,7 @@ void Verlet::setup(int flag)
   }
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish setup_pre_force\n");
 
-
+  
   if (pair_compute_flag) {
     if(comm->thread_pool_flag) {
       lmp->execute(LAMMPS::PAIR_COMPUTE);
@@ -182,6 +213,11 @@ void Verlet::setup(int flag)
 
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish compute\n");
 
+  
+  // if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] after pair lmp->execute(LAMMPS::PAIR_COMPUTE) \n"), atom->f[0], atom->nlocal * 3, 1);
+  
+  for(int nu = 0; nu < NUMA_NUM; nu++)
+    if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] after pair lmp->execute(LAMMPS::PAIR_COMPUTE) nu {} \n", nu), atom->f[0] + comm->lb_offset[nu]*3, comm->numa_nlocal[nu] * 3, 1);
 
   if (atom->molecular != Atom::ATOMIC) {
     if (force->bond) force->bond->compute(eflag,vflag);
@@ -197,23 +233,39 @@ void Verlet::setup(int flag)
   }
 
   modify->setup_pre_reverse(eflag,vflag);
+
+  
   if (force->newton) {
-    if(comm->thread_pool_flag)
-      lmp->execute(LAMMPS::REVERSE_XMIT);
+    if(comm->numa_flag) {
+      lmp->execute(LAMMPS::REVERSE_NUMA);
+    }
+    else if(comm->thread_pool_flag) {
+        lmp->execute(LAMMPS::REVERSE_XMIT);
+    }
     else
       comm->reverse_comm();
   }
+  if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish reverse\n");
+
+
+  if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] after reverse lmp->execute(LAMMPS::PAIR_COMPUTE) \n"), atom->f[0], atom->nlocal * 3, 1);
+  
+  // MPI_Barrier(world);
+
+  // lmp->execute(LAMMPS::REVERSE_XMIT);
 
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin  modify->setup\n");
   modify->setup(vflag);
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish  modify->setup\n");
 
-
-
   output->setup(flag);
   if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish verlet setup\n");
 
   update->setupflag = 0;
+
+  // MPI_Barrier(world);  
+  // MPI_Finalize();
+  // exit(0);
 }
 
 
@@ -266,16 +318,38 @@ void Verlet::run(int n)
 
     if(DEBUG_MSG) utils::logmesg(lmp,"[info] neighbor->decide {}\n", nflag);
 
+    // if(DEBUG_MSG) utils::logmesg_arry(lmp, fmt::format("[NUMA] after atom->x {}", (void*)atom->x[0]), atom->x[0], (atom->nlocal + atom->nghost) * 3, 1); 
 
     if (nflag == 0) {
       if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin forward timestap {}\n", update->ntimestep);
 
+      // self_timer->stamp();
+      // MPI_Barrier(world);
+      // self_timer->stamp(Timer::BARRIER_FW_0);
+
       timer->stamp();
-      if(comm->thread_pool_flag)
+      self_timer->stamp();
+
+      if(comm->numa_flag){
+          lmp->execute(LAMMPS::FORWARD_NUMA);    
+      }
+      else if(comm->thread_pool_flag){
           lmp->execute(LAMMPS::FORWARD_XMIT);
-      else
+      }
+      else{
         comm->forward_comm();
+      }
       timer->stamp(Timer::COMM);
+      self_timer->stamp(Timer::FORWARD);
+
+      // self_timer->stamp();
+      // MPI_Barrier(world);
+      // self_timer->stamp(Timer::BARRIER_FW_1);      
+      
+
+      if(DEBUG_MSG) utils::logmesg_arry_x(lmp, fmt::format("[NUMA] forward atom->x {}", (void*)atom->x[0]), atom->x[0], (atom->nlocal + atom->nghost) * 3, 1); 
+      // MPI_Barrier(world);
+
       if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish forward_comm timestap {}\n", update->ntimestep);
 
     } else {
@@ -291,17 +365,30 @@ void Verlet::run(int n)
         comm->setup();
         if (neighbor->style) neighbor->setup_bins();
       }
-      if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin exchange timestap {}\n", update->ntimestep);
+      if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin exchange timestap {}\n", update->ntimestep);     
 
       timer->stamp();
+      self_timer->stamp();
       comm->exchange();
-      if (sortflag && ntimestep >= atom->nextsort) atom->sort();
+      self_timer->stamp(Timer::EXCANGE);
+      // if (sortflag && ntimestep >= atom->nextsort) atom->sort();
       if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin borders timestap {}\n", update->ntimestep);
 
-      if(comm->thread_pool_flag)
-        lmp->execute(LAMMPS::BORDER_XMIT);
-      else 
-        comm->borders();
+      // MPI_Barrier(world);
+      self_timer->stamp();
+      if(comm->numa_flag) {
+        lmp->execute(LAMMPS::BORDER_NUMA);  
+      } else {
+        if(comm->thread_pool_flag)
+          lmp->execute(LAMMPS::BORDER_COMBINE);
+        else
+          comm->borders();
+      }
+      
+      self_timer->stamp(Timer::BOARDER);
+      // MPI_Barrier(world);
+
+
       if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish borders timestap {}\n", update->ntimestep);
 
       if (triclinic) domain->lamda2x(atom->nlocal+atom->nghost);
@@ -327,6 +414,8 @@ void Verlet::run(int n)
 
     force_clear();
 
+    // MPI_Barrier(world);
+
     timer->stamp();
 
     if (n_pre_force) {
@@ -339,22 +428,46 @@ void Verlet::run(int n)
       }
       timer->stamp(Timer::MODIFY);
       if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish pre_force timestap {}\n", update->ntimestep);
-
     }
 
+    // MPI_Barrier(world);
+
+    // self_timer->stamp();
+    // MPI_Barrier(world);
+    // self_timer->stamp(Timer::BARRIER_FW_0);
+
+    timer->stamp();
     if (pair_compute_flag) {
       if(comm->thread_pool_flag) {
         lmp->execute(LAMMPS::PAIR_COMPUTE);
       } else {
         force->pair->compute(eflag,vflag);
       }
+
+      // MPI_Barrier(world);
       timer->stamp(Timer::PAIR);
+
+      // self_timer->stamp();
+      // MPI_Barrier(nuworld);
+      // self_timer->stamp(Timer::BARRIER_PA_0);    
+
+      // self_timer->stamp();
+      // MPI_Barrier(world);
+      // self_timer->stamp(Timer::BARRIER_PA_1);    
+
     }
-      if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish compute timestap {}\n", update->ntimestep);
+    if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish compute timestap {}\n", update->ntimestep);
 
+    // if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] after pair lmp->execute(LAMMPS::PAIR_COMPUTE) \n"), atom->f[0], atom->nlocal * 3, 1);
+    for(int nu = 0; nu < NUMA_NUM; nu++)
+      if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] after pair lmp->execute(LAMMPS::PAIR_COMPUTE) nu {} \n", nu), atom->f[0] + comm->lb_offset[nu]*3, comm->numa_nlocal[nu] * 3, 1);
 
+    // MPI_Barrier(world);  
+    // MPI_Finalize();
+    // exit(0);
+  
     if (atom->molecular != Atom::ATOMIC) {
-      if (force->bond) force->bond->compute(eflag,vflag);
+      if (force->bond) force->bond->compute(eflag,vflag); 
       if (force->angle) force->angle->compute(eflag,vflag);
       if (force->dihedral) force->dihedral->compute(eflag,vflag);
       if (force->improper) force->improper->compute(eflag,vflag);
@@ -374,15 +487,33 @@ void Verlet::run(int n)
     // reverse communication of forces
     if(DEBUG_MSG) utils::logmesg(lmp,"[info] begin reverse_comm timestap {}\n", update->ntimestep);
 
-    if (force->newton) {
-        if(comm->thread_pool_flag)
-          lmp->execute(LAMMPS::REVERSE_XMIT);
-        else
-          comm->reverse_comm();
-      timer->stamp(Timer::COMM);
-    }
-    if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish reverse_comm timestap {}\n", update->ntimestep);
+    // self_timer->stamp();
+    // MPI_Barrier(world);
+    // self_timer->stamp(Timer::BARRIER_RD_0);
 
+    self_timer->stamp();
+    timer->stamp();
+    if (force->newton) {
+      if(comm->numa_flag) {
+        lmp->execute(LAMMPS::REVERSE_NUMA);
+      }
+      else if(comm->thread_pool_flag) {
+          lmp->execute(LAMMPS::REVERSE_XMIT);
+      }
+      else
+        comm->reverse_comm();
+    }
+    timer->stamp(Timer::COMM);
+    self_timer->stamp(Timer::REVERSE);
+    // self_timer->stamp();
+    // MPI_Barrier(world);
+    // self_timer->stamp(Timer::BARRIER_RD_1);
+
+    // MPI_Barrier(world);
+
+    if(DEBUG_MSG) utils::logmesg_arry_x(lmp,fmt::format("[info] after reverse lmp->execute(LAMMPS::PAIR_COMPUTE) \n"), atom->f[0], atom->nlocal * 3, 1);
+
+    if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish reverse_comm timestap {}\n", update->ntimestep);
 
     // force modifications, final time integration, diagnostics
 
@@ -392,8 +523,6 @@ void Verlet::run(int n)
     if (n_end_of_step) modify->end_of_step();
     timer->stamp(Timer::MODIFY);
     if(DEBUG_MSG) utils::logmesg(lmp,"[info] finish final_integrate timestap {}\n", update->ntimestep);
-
-
 
     // all output
 
@@ -695,6 +824,9 @@ void Verlet::cleanup()
 void Verlet::force_clear()
 {
   size_t nbytes;
+
+  if(DEBUG_MSG) utils::logmesg(lmp,"[info] external_force_clear {}\n", external_force_clear);
+
 
   if (external_force_clear) return;
 

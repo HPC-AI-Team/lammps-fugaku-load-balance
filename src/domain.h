@@ -74,8 +74,10 @@ class Domain : protected Pointers {
   // orthogonal box
   double lcl_xprd, lcl_yprd, lcl_zprd;                   // global box dimensions
   double lcl_prd[3];
+  double lcl_nuprd[3];
 
   double sublo[3], subhi[3];    // sub-box bounds on this proc
+  double nusublo[3], nusubhi[3];    // sub-box bounds on this proc
 
   // triclinic box
   // sublo/hi = undefined

@@ -60,8 +60,8 @@ void PairLJCutThreadpool::compute(int eflag, int vflag, int tid) {
   // if(comm->me == 0)utils::logmesg(PairLJCut::lmp,"Threadpool::compute tid {} ifrom {} ito {} nthreads  {} flag {} {} nlocal {}\n", 
   //         tid, ifrom, ito, nthreads, eflag, vflag, atom->nlocal);
 
-  if(DEBUG_MSG) utils::logmesg(PairLJCut::lmp,"Threadpool::compute tid {} ifrom {} ito {} nthreads  {} flag {} {} nlocal {}\n", 
-          tid, ifrom, ito, nthreads, eflag, vflag, atom->nlocal);
+  if(DEBUG_MSG) utils::logmesg(PairLJCut::lmp,"Threadpool::compute tid {} ifrom {} ito {} nthreads  {} flag {} {} nlocal {} faddr {}\n", 
+          tid, ifrom, ito, nthreads, eflag, vflag, atom->nlocal, (void*)thr->get_f()[0]);
   
   ev_setup_thr(eflag, vflag, nall, eatom, vatom, nullptr, thr);
 
@@ -151,7 +151,6 @@ void PairLJCutThreadpool::eval(int iifrom, int iito, ThrData * const thr)
 
   // utils::logmesg(PairLJCut::lmp, "eval tid {} ifrom {} ito {} nall  {}\n", 
   //         thr->get_tid(), iifrom, iito, nall);
-
 
   for (int ii = iifrom; ii < iito; ++ii) {  
     const int i = ilist[ii];

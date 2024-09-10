@@ -58,6 +58,16 @@ class AtomVec : protected Pointers {
 
   bool domain_nmax_flag;
 
+  tagint *tag;    // peratom fields common to all styles
+  int *type, *mask;
+  imageint *image;
+  double **x, **v, **f;
+
+  tagint *nutag;
+  int *nutype, *numask;
+  imageint *nuimage;
+  double **nux, **nuv, **nuf;
+  
   // additional list of peratom fields operated on by different methods
   // set or created by child styles
 
@@ -97,8 +107,10 @@ class AtomVec : protected Pointers {
   virtual void unpack_reverse(int, int *, double *);
 
   virtual int pack_border(int, int *, double *, int, int *);
+  virtual int pack_border_numa(double *);
   virtual int pack_border_vel(int, int *, double *, int, int *);
   virtual void unpack_border(int, int, double *);
+  virtual void unpack_border_numa(int, int, double *);
   virtual void unpack_border_vel(int, int, double *);
 
   virtual int pack_border_bonus(int, int *, double *) { return 0; }
@@ -153,6 +165,9 @@ class AtomVec : protected Pointers {
   virtual int pack_data_bonus(double *, int) { return 0; }
   virtual void write_data_bonus(FILE *, int, double *, int) {}
 
+  virtual void determin_max();
+  virtual void grow_init();
+
   virtual int property_atom(const std::string &) { return -1; }
   virtual void pack_property_atom(int, double *, int, int) {}
 
@@ -165,10 +180,7 @@ class AtomVec : protected Pointers {
   int deform_groupbit;
   double *h_rate;
 
-  tagint *tag;    // peratom fields common to all styles
-  int *type, *mask;
-  imageint *image;
-  double **x, **v, **f;
+  
 
   // standard list of peratom fields always operated on by different methods
   // common to all styles, so not listed in field strings

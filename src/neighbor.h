@@ -174,6 +174,8 @@ class Neighbor : protected Pointers {
   bigint last_setup_bins;    // step of last neighbor::setup_bins() call
 
   class NPair **neigh_pair;
+  class NBin **neigh_bin;
+
 
  protected:
   int me, nprocs;
@@ -225,7 +227,6 @@ class Neighbor : protected Pointers {
   BinCreator *binclass;
   char **binnames;
   int *binmasks;
-  class NBin **neigh_bin;
 
   typedef class NStencil *(*StencilCreator)(class LAMMPS *);
   StencilCreator *stencilclass;

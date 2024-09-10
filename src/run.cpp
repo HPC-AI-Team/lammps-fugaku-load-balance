@@ -23,7 +23,7 @@
 #include "output.h"
 #include "timer.h"
 #include "update.h"
-
+#include "deepmd_util.h"
 #include <cstring>
 
 using namespace LAMMPS_NS;
@@ -153,6 +153,7 @@ void Run::command(int narg, char **arg)
 
   update->whichflag = 1;
   timer->init_timeout();
+  self_timer->init_timeout();
 
   if (nevery == 0) {
     update->nsteps = nsteps;
@@ -172,9 +173,12 @@ void Run::command(int narg, char **arg)
     } else output->setup(0);
 
     timer->init();
+    self_timer->init();
     timer->barrier_start();
+    self_timer->barrier_start();
     update->integrate->run(nsteps);
     timer->barrier_stop();
+    self_timer->barrier_stop();
 
     update->integrate->cleanup();
 
@@ -214,8 +218,18 @@ void Run::command(int narg, char **arg)
 
       timer->init();
       timer->barrier_start();
+      self_timer->init();
+      self_timer->barrier_start();
+      for(int jj = 0 ; jj < T_THREAD; jj++) {
+        lmp->deep_pots[jj]->t_timer->init();
+        lmp->deep_pots[jj]->t_timer->barrier_start();
+      }
       update->integrate->run(nsteps);
       timer->barrier_stop();
+      self_timer->barrier_stop();
+      for(int jj = 0 ; jj < T_THREAD; jj++) {
+        lmp->deep_pots[jj]->t_timer->barrier_stop();
+      }
 
       update->integrate->cleanup();
 

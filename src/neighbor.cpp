@@ -2247,8 +2247,10 @@ void Neighbor::setup_bins()
   // invoke setup_bins() for all NBin
   // actual binning is performed in build()
 
-  for (int i = 0; i < nbin; i++)
+  for (int i = 0; i < nbin; i++) {
     neigh_bin[i]->setup_bins(style);
+    neigh_bin[i]->setup_bins_numa(style);
+  } 
 
   // invoke create_setup() and create() for all perpetual NStencil
   // same ops performed for occasional lists in build_one()
@@ -2362,6 +2364,8 @@ void Neighbor::build(int topoflag)
 
   int nlocal = atom->nlocal;
   int nall = nlocal + atom->nghost;
+  int nunlocal = atom->nunlocal;
+  int nunall = atom->nunlocal + atom->nunghost;
   // rebuild collection array from scratch
   if (style == Neighbor::MULTI) build_collection(0);
 
@@ -2414,8 +2418,11 @@ void Neighbor::build(int topoflag)
   if (style != Neighbor::NSQ) {
     if (last_setup_bins < 0) setup_bins();
     for (i = 0; i < nbin; i++) {
-      neigh_bin[i]->bin_atoms_setup(nall);
-      neigh_bin[i]->bin_atoms();
+      // neigh_bin[i]->bin_atoms_setup(nall);
+      // neigh_bin[i]->bin_atoms();
+
+      neigh_bin[i]->bin_atoms_setup_numa(atom->nmax);
+      neigh_bin[i]->bin_atoms_numa();
     }
   }
 
@@ -2425,7 +2432,10 @@ void Neighbor::build(int topoflag)
   for (i = 0; i < npair_perpetual; i++) {
     m = plist[i];
     if (!lists[m]->copy || lists[m]->trim || lists[m]->kk2cpu)
-      lists[m]->grow(nlocal,nall);
+      lists[m]->grow(nunlocal,nunall);
+
+
+    if(DEBUG_MSG) utils::logmesg(lmp,"[NUMA] neighbor npair_perpetual {} m  {} \n", npair_perpetual, m);
     neigh_pair[m]->build_setup();
     if(comm->thread_pool_flag) {
       threadpool_m = m;

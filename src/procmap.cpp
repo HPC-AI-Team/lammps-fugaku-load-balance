@@ -25,6 +25,7 @@
 #include "memory.h"
 #include "tokenizer.h"
 #include "universe.h"
+#include <algorithm>
 
 #include <cmath>
 #include <cstring>
@@ -78,8 +79,7 @@ void ProcMap::onelevel_grid(int nprocs, int *user_procgrid, int *procgrid,
 }
 
 
-void ProcMap::utofu_grid(int *procgrid, double *boxlo, double*boxhi)
-{
+void ProcMap::utofu_grid(int *procgrid, double *boxlo, double*boxhi) {
   int me, nprocs;
   double outer_area[6]; 
   MPI_Comm_rank(world,&me);
@@ -118,7 +118,8 @@ void ProcMap::utofu_grid(int *procgrid, double *boxlo, double*boxhi)
   outer_area[4] = procgrid[0] * 4 * procgrid[1] + procgrid[0] * procgrid[2] + 4 * procgrid[1] * procgrid[2];
   outer_area[5] = procgrid[0] * procgrid[1] + procgrid[0] * 4 * procgrid[2] + procgrid[1] * 4 * procgrid[2];
 
-  int min_area = std::min_element(outer_area, outer_area+6) - outer_area;
+  // int min_area = std::min_element(outer_area, outer_area+6) - outer_area;
+  int min_area = 0;
 
   switch (min_area)
   {

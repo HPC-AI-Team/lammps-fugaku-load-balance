@@ -38,6 +38,18 @@ class NBin : protected Pointers {
   int *bins;        // index of next atom in same bin
   int *atom2bin;    // bin assignment for each atom (local+ghost)
 
+  int numbins;                  // # of local bins and offset on this proc
+  int numbinx, numbiny, numbinz;
+  int numbinxlo, numbinylo, numbinzlo;
+
+  int *nubinhead;     // index of first atom in each nubin
+  int *nubins;        // index of next atom in same bin
+  int *nuatom2bin;    // bin assignment for each atom (local+ghost)
+
+
+
+
+
   // Analogues for NBinMultimulti
 
   int *nbinx_multi, *nbiny_multi, *nbinz_multi;
@@ -57,7 +69,15 @@ class NBin : protected Pointers {
   virtual void bin_atoms_setup(int) = 0;
   virtual void setup_bins(int) = 0;
   virtual void bin_atoms() = 0;
+
+  virtual void bin_atoms_setup_numa(int){};
+  virtual void setup_bins_numa(int){};
+  virtual void bin_atoms_numa(){};
+
   virtual double memory_usage() { return 0.0; }
+
+  int coord2bin_numa(double *);
+
 
   // Kokkos package
 
@@ -84,6 +104,9 @@ class NBin : protected Pointers {
 
   int maxatom;    // size of bins array
   int maxbin;     // size of binhead array
+
+  int numaxatom;    // size of bins array
+  int numaxbin;     // size of binhead array
 
   // data for multi NBin
 

@@ -38,11 +38,11 @@ class Atom : protected Pointers {
   enum { MAP_NONE = 0, MAP_ARRAY = 1, MAP_HASH = 2, MAP_YES = 3 };
 
   // atom counts
-
+  int noffset;
   bigint natoms;         // total # of atoms in system, could be 0
                          // natoms may not be current if atoms lost
-  int nlocal, nghost;    // # of owned and ghost atoms on this proc
-  int nmax;              // max # of owned+ghost in arrays on this proc
+  int nlocal, nghost, nunlocal, nunghost;    // # of owned and ghost atoms on this proc
+  int nmax, nunmax;              // max # of owned+ghost in arrays on this proc
   int tag_enable;        // 0/1 if atom ID tags are defined
   int molecular;         // 0 = atomic, 1 = standard molecular system,
                          // 2 = molecule template system
@@ -71,6 +71,11 @@ class Atom : protected Pointers {
   int *type, *mask;
   imageint *image;
   double **x, **v, **f;
+
+  tagint *nutag;
+  int *nutype, *numask;
+  imageint *nuimage;
+  double **nux, **nuv, **nuf;
 
   // charged and dipolar particles
 

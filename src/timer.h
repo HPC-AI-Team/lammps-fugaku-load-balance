@@ -36,14 +36,60 @@ class Timer : protected Pointers {
     EXCANGE,
     FORWARD,
     REVERSE,
+    PAIR_OPT,
+
+    REVERSE_CPY,
+    REVERSE_COMM,
+    REVERSE_REDUCE,
+    FORWARD_CPY,
+    FORWARD_COMM,
+    FORWARD_PBC,
+
+    BARRIER_FW_0,
+    BARRIER_FW_1,
+    BARRIER_RD_0,
+    BARRIER_RD_1,
+    BARRIER_PA_0,
+    BARRIER_PA_1,
+
+    BOARDER_NUMA,
+    EXCANGE_NUMA,
+    FORWARD_NUMA,
+    REVERSE_NUMA,
+    PAIR_NUMA,
+    FIX_INIT,
+    FIX_FINAL,
     
-    PAIR_SEND,
-    PAIR_RECV,
-    PAIR_WAIT,
-    PAIR_CPY,
-    BOARDER_NUM_SEND,
     BOARDER_BUF_SEND,
     OUTPUT_REDUCE,
+    NUMA_SHARE,
+
+    PREPARE,
+    DO_NEIGHBOR,
+    PROD_ENV,
+    EM_SLICE,
+    TABULATE,
+    EM_MUT_3D,
+    FIT_CAST,
+    TABULATE_GRAD,
+    PROD_FV,
+
+    MATMUL_ADD_0,
+    MATMUL_ADD_1,
+    MATMUL_ADD_2,
+    MATMUL_ADD_3,
+    FAST_TANH,
+    FAST_TANH_GRAD,
+    IDT_MULT,
+    IDT_MULT_GRAD,
+    MATRIX_ADD,
+    MATMUL_3D,
+    FIT_SLICE,
+
+    MATMUL_2D_0,
+    MATMUL_2D_1,
+    MATMUL_2D_2,
+    MATMUL_2D_3,
 
     SYNC,
     ALL,
@@ -116,10 +162,10 @@ class Timer : protected Pointers {
   }
 
   void modify_params(int, char **);
-
- private:
   double cpu_array[NUM_TIMER];
   double wall_array[NUM_TIMER];
+
+ private:
   double previous_cpu;
   double previous_wall;
   double timeout_start;

@@ -455,6 +455,7 @@ void Output::write(bigint ntimestep)
   next = MIN(next,next_thermo);
 }
 
+
 /* ----------------------------------------------------------------------
    force a snapshot to be written for all dumps
    called from PRD and TAD

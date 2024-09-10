@@ -54,6 +54,23 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
   MPI_Comm_rank(world,&me);
   MPI_Comm_size(world,&nprocs);
 
+  numa_id = me % NUMA_NUM;
+  node_id = me / 4;
+
+  // numa_group_id[0] = 0; numa_group_id[1] = 0;
+  if(numa_id == 2 || numa_id == 0) { numa_group_id[0] = 0; numa_group_id[1] = 2;}
+  if(numa_id == 3 || numa_id == 1) { numa_group_id[0] = 1; numa_group_id[1] = 3;}
+
+  if(numa_id == 0) {numa_oppo_id[0] = numa_id; numa_oppo_id[1] = 1;}
+  if(numa_id == 1) {numa_oppo_id[0] = numa_id; numa_oppo_id[1] = 0;}
+  if(numa_id == 2) {numa_oppo_id[0] = numa_id; numa_oppo_id[1] = 3;}
+  if(numa_id == 3) {numa_oppo_id[0] = numa_id; numa_oppo_id[1] = 2;}
+
+  if(numa_id == 0) {numa_send_id[0] = 2; numa_send_id[1] = 3;}
+  if(numa_id == 1) {numa_send_id[0] = 2; numa_send_id[1] = 3;}
+  if(numa_id == 2) {numa_send_id[0] = 2; numa_send_id[1] = 3;}
+  if(numa_id == 3) {numa_send_id[0] = 2; numa_send_id[1] = 3;}
+
   mode = 0;
   bordergroup = 0;
   cutghostuser = 0.0;
@@ -81,12 +98,23 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
   rcbnew = 0;
   multi_reduce = 0;
 
-  comm_omp_flag = comm_piggy_flag  = 
-      comm_border_one_flag = thread_pool_flag = 
+  full_flag = 0;
+
+  // int pol = -1, rc = -1;
+  // struct bitmask *nmask = numa_allocate_nodemask();
+  // numa_bitmask_clearall(nmask);
+  // int* _test_numa = new int[100];
+  // get_mempolicy(&pol, nmask->maskp, nmask->size, _test_numa, MPOL_F_ADDR);
+  // rc = get_mempolicy(&pol, NULL,0, _test_numa, MPOL_F_NODE | MPOL_F_ADDR);
+  // utils::logmesg(lmp,"  numa_policy rc {} pol {} \n",rc, pol);
+
+
+  cblas_open_flag = comm_piggy_flag  = 
+      comm_border_one_flag = thread_pool_flag = numa_flag = lb_flag = fp16_flag =
       debug_flag = false;
 
-  if (getenv("COMM_OMP_FLAG") != nullptr && atoi(getenv("COMM_OMP_FLAG")) == 1) {
-    comm_omp_flag = true;
+  if (getenv("CBLAS_OPEN_FLAG") != nullptr && atoi(getenv("CBLAS_OPEN_FLAG")) == 1) {
+    cblas_open_flag = true;
   }
   if (getenv("COMM_PIGGY_FLAG") != nullptr && atoi(getenv("COMM_PIGGY_FLAG")) == 1) {
     comm_piggy_flag = true;
@@ -97,19 +125,29 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
   if (getenv("THREAD_POOL_FLAG") != nullptr && atoi(getenv("THREAD_POOL_FLAG")) == 1) {
     thread_pool_flag = true;
   }
+  if (getenv("NUMA_FLAG") != nullptr && atoi(getenv("NUMA_FLAG")) == 1) {
+    numa_flag = true;
+  }
+  if (getenv("TEST_FP16") != nullptr && atoi(getenv("TEST_FP16")) == 1) {
+    fp16_flag = true;
+  }
+  if (getenv("LOAD_BALANCE_FLAG") != nullptr && atoi(getenv("LOAD_BALANCE_FLAG")) == 1) {
+    lb_flag = true;
+  }
   if (getenv("COMM_DEBUG_FLAG") != nullptr && atoi(getenv("COMM_DEBUG_FLAG")) == 1) {
     debug_flag = true;
   }
 
   if (me == 0){
-    utils::logmesg(lmp,"  COMM_OMP_FLAG {} \n",comm_omp_flag);
+    utils::logmesg(lmp,"  CBLAS_OPEN_FLAG {} \n",cblas_open_flag);
     utils::logmesg(lmp,"  COMM_PIGGY_FLAG {} \n",comm_piggy_flag);
     utils::logmesg(lmp,"  COMM_BORDER_ONE_FLAG {} \n",comm_border_one_flag);
+    utils::logmesg(lmp,"  NUMA_FLAG {} \n",numa_flag);
+    utils::logmesg(lmp,"  TEST_FP16 {} \n",fp16_flag);
     utils::logmesg(lmp,"  THREAD_POOL_FLAG {} \n",thread_pool_flag);
+    utils::logmesg(lmp,"  LOAD_BALANCE_FLAG {} \n",lb_flag);
     utils::logmesg(lmp,"  COMM_DEBUG_FLAG {} \n",debug_flag);
   }
-
-
   
   // use of OpenMP threads
   // query OpenMP for number of threads/process set by user at run-time
@@ -119,6 +157,11 @@ Comm::Comm(LAMMPS *lmp) : Pointers(lmp)
   // as many threads as there are (virtual) CPU cores by default.
 
   nthreads = 1;
+
+  nuworld = lmp->nuworld;
+  MPI_Comm_rank(nuworld,&nume);
+
+  if(debug_flag) utils::logmesg(lmp,"[NUMA]  me in nuworld {} \n", nume);
 
   if(thread_pool_flag) {
     nthreads = 12;

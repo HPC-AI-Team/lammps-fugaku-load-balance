@@ -125,7 +125,7 @@ LAMMPS* LAMMPS::curMy = NULL;
 LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
   memory(nullptr), error(nullptr), universe(nullptr), input(nullptr), atom(nullptr),
   update(nullptr), neighbor(nullptr), comm(nullptr), domain(nullptr), force(nullptr),
-  modify(nullptr), group(nullptr), output(nullptr), timer(nullptr), kokkos(nullptr),
+  modify(nullptr), group(nullptr), output(nullptr), timer(nullptr), self_timer(nullptr), kokkos(nullptr),
   atomKK(nullptr), memoryKK(nullptr), python(nullptr), citeme(nullptr)
 {
 
@@ -179,6 +179,7 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
     int me,nprocs;
     MPI_Comm_rank(communicator,&me);
     MPI_Comm_size(communicator,&nprocs);
+
     int color = atoi(arg[iarg+1]);
     MPI_Comm subcomm;
     MPI_Comm_split(communicator,color,me,&subcomm);
@@ -187,6 +188,26 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
     delete universe;
     universe = new Universe(this,communicator);
   }
+
+  {
+    int me, node_id;
+    MPI_Comm_rank(communicator,&me);
+    numa_id = me % 4;
+    node_id = me / 4;
+
+    MPI_Comm_split(communicator, node_id, me, &nuworld);
+    MPI_Comm_split(communicator, numa_id, me, &m_world);
+
+    int nu_me;
+    int m_me;
+    MPI_Comm_rank(nuworld,&nu_me);
+    MPI_Comm_rank(m_world,&m_me);
+
+    if (getenv("COMM_DEBUG_FLAG") != nullptr && atoi(getenv("COMM_DEBUG_FLAG")) == 1) {
+      printf("[info] finish nuworld %d m_world  %d\n", nu_me, m_me);   
+    }
+  }
+
 
   // parse input switches
 
@@ -854,6 +875,7 @@ void LAMMPS::create()
                               // must be after modify so can create Computes
   update = new Update(this);  // must be after output, force, neighbor
   timer = new Timer(this);
+  self_timer = new Timer(this);
 
   python = new Python(this);
 
@@ -1005,6 +1027,9 @@ void LAMMPS::destroy()
 
   delete timer;
   timer = nullptr;
+
+  delete self_timer;
+  self_timer = nullptr;
 
   delete python;
   python = nullptr;
@@ -1474,6 +1499,7 @@ void LAMMPS::print_config(FILE *fp)
 }
 
 void LAMMPS::pthread_pool_start() {
+  init_excutions();
   is_excute = 0;
 
   for(int i = 0; i < T_THREAD; i++) {
@@ -1552,20 +1578,41 @@ void LAMMPS::pthread_test(){
   utils::logmesg(this, "finish one excute \n"); 
 }
 
-void LAMMPS::parral_barrier(int t_num, int tid){
+void LAMMPS::parral_barrier(int t_num, int tid) {
   int sptr = mtx_ptr[tid];
   int sptr_last = (sptr - 5) < 0 ? sptr + T_THREAD - 5 : sptr - 5;
 
-  if(tid == THREAD_NUM){
-    is_barrier[sptr_last] = 0;
+  if(t_num == T_THREAD) {   
+
+    if(tid == THREAD_NUM) {
+      is_barrier[sptr_last] = 0;
+    }
+
+    int tmp = 1 << tid;
+    is_barrier[sptr] |= tmp;
+
+    while(is_barrier[sptr] != 0xfff) ;
+
+    mtx_ptr[tid] = (mtx_ptr[tid] + 1) % T_THREAD;
+  } else {
+    if(tid == 0) {
+      is_barrier[sptr_last] = 0;
+    }
+
+    int tmp = 1 << tid;
+    is_barrier[sptr] |= tmp;
+
+    int tmp_barr = 0;
+    for(int i = 0; i < t_num; i++) tmp_barr = (tmp_barr << 1) | 0x1;
+
+    while(is_barrier[sptr] != tmp_barr) ;
+
+    mtx_ptr[tid] = (mtx_ptr[tid] + 1) % T_THREAD;
+    if(tid == 0) {
+      for(int _tid = t_num; _tid < T_THREAD; _tid++) mtx_ptr[_tid] = (mtx_ptr[_tid] + 1) % T_THREAD;
+    }
   }
 
-  int tmp = 1 << tid;
-  is_barrier[sptr] |= tmp;
-
-  while(is_barrier[sptr] != 0xfff) ;
-
-  mtx_ptr[tid] = (mtx_ptr[tid] + 1) % T_THREAD;
 
   // int sptr = mtx_ptr[tid];
 
@@ -1599,112 +1646,251 @@ void LAMMPS::parral_barrier(int t_num, int tid){
   // mtx_ptr[tid] = (mtx_ptr[tid] + 1) % T_THREAD;
 }
 
-void LAMMPS::execute(enum Fun_type fun_type){
+void LAMMPS::execute(enum Fun_type fun_type) {
   switch (fun_type)
   {
-  case FORWARD_XMIT:
+  case FORWARD_XMIT: {
     if(DEBUG_MSG) utils::logmesg(this, "execute FORWARD_XMIT \n"); 
-    is_excute = 0b000010000100001000010000100001ull;
+    is_excute = excutions[FORWARD_XMIT];
     while(is_excute){};
     comm->c_vcq = (comm->c_vcq + 1) % VCQ_NUM;
     break;
-  case REVERSE_XMIT:  
+  }
+  case FORWARD_NUMA:{
+    if(DEBUG_MSG) utils::logmesg(this, "execute FORWARD_NUMA \n"); 
+    is_excute = excutions[FORWARD_NUMA];
+    comm->forward_comm_parral_numa(THREAD_NUM);
+    while(is_excute){};
+    comm->c_vcq = (comm->c_vcq + 1) % VCQ_NUM;
+    break;
+  }
+  case REVERSE_XMIT:  {
     if(DEBUG_MSG) utils::logmesg(this, "execute REVERSE_XMIT \n"); 
-    is_excute = 0b000100001000010000100001000010ull;
+    is_excute = excutions[REVERSE_XMIT];
     while(is_excute){};
     comm->reverse_comm_parral_unpack();
     comm->c_vcq = (comm->c_vcq + 1) % VCQ_NUM;
     break;
-  case BORDER_XMIT:
-    if(DEBUG_MSG) utils::logmesg(this, "execute BORDER_XMIT \n"); 
-    comm->borders_one_parral_sendlist();
-    
-    if(DEBUG_MSG) utils::logmesg(this, "execute BORDERS_XMIT_BUF \n"); 
-    is_excute = 0b001010010100101001010010100101ull;
-    while(is_excute){};    
-    comm->c_vcq = (comm->c_vcq + 1) % VCQ_NUM;
-
-    if(DEBUG_MSG) utils::logmesg(this, "execute BORDERS_FIRSTRECV \n"); 
-    comm->borders_one_parral_firstrecv();
-
-    if(DEBUG_MSG) utils::logmesg(this, "execute BORDERS_XMIT_POS \n"); 
-    is_excute = 0b001110011100111001110011100111ull;
+  }
+  case REVERSE_NUMA:  {
+    if(DEBUG_MSG) utils::logmesg(this, "execute REVERSE_NUMA \n"); 
+    is_excute = excutions[REVERSE_NUMA];
+    comm->reverse_comm_parral_numa(THREAD_NUM);
     while(is_excute){};
+    // comm->reverse_comm_parral_unpack_numa();
     comm->c_vcq = (comm->c_vcq + 1) % VCQ_NUM;
+    break;
+  }
+  case BORDER_COMBINE:{
+    if(DEBUG_MSG) utils::logmesg(this, "execute BORDER_COMBINE \n"); 
+    is_excute = excutions[BORDER_COMBINE];
+    comm->borders_one_parrral(THREAD_NUM);
 
-    if(DEBUG_MSG) utils::logmesg(this, "execute BORDERS_FINISH \n"); 
-    comm->borders_one_parral_finish();
+    // if(DEBUG_MSG) utils::logmesg(this, " BORDER_COMBINE wait \n"); 
+    while(is_excute){};    
+    // if(DEBUG_MSG) utils::logmesg(this, "finish BORDER_COMBINE \n"); 
     break;
-  case EXCHANGE_XMIT:
+  }
+  case BORDER_NUMA:{
+    if(DEBUG_MSG) utils::logmesg(this, "execute BORDERS_NUMA \n"); 
+    is_excute = excutions[BORDER_NUMA];
+    comm->borders_one_parrral_numa(THREAD_NUM);
+    // if(DEBUG_MSG) utils::logmesg(this, "BORDERS_NUMA wait finish \n"); 
+    while(is_excute){};
+    // if(DEBUG_MSG) utils::logmesg(this, "finish BORDERS_NUMA \n"); 
+    comm->c_vcq = (comm->c_vcq + 1) % VCQ_NUM;
     break;
-  case NEIGHBOR_BUILD:
+  }
+  case EXCHANGE_XMIT:{
+    break;
+  }
+  // case NUMA_SHARE_ATOM:{
+  //   if(DEBUG_MSG) utils::logmesg(this, "execute numa_share_atom \n"); 
+  //   is_excute = excutions[NUMA_SHARE_ATOM];
+  //   while(is_excute){};
+  //   break;
+  // }
+  // case NUMA_ATOM_INIT:{
+  //   if(DEBUG_MSG) utils::logmesg(this, "execute NUMA_ATOM_INIT \n"); 
+  //   is_excute = excutions[NUMA_ATOM_INIT];
+  //   while(is_excute){};
+  //   break;
+  // }
+  case NEIGHBOR_BUILD:{
     if(DEBUG_MSG) utils::logmesg(this, "execute NEIGHBOR_BUILD \n"); 
-    is_excute = 0b0101001010010100101001010010100101001010010100101001010ull;
+    is_excute = excutions[NEIGHBOR_BUILD];
     int m = neighbor->threadpool_m;
     neighbor->neigh_pair[m]->build_parral(neighbor->lists[m], THREAD_NUM);
     while(is_excute){};
-    neighbor->lists[m]->inum = atom->nlocal;
+    neighbor->lists[m]->inum = comm->pair_len;
     break;  
-  case PAIR_COMPUTE:
+  }
+  // case NEIGHBOR_NUMA:{
+  //   if(DEBUG_MSG) utils::logmesg(this, "execute NEIGHBOR_NUMA \n"); 
+  //   is_excute = excutions[NEIGHBOR_NUMA];
+  //   int num = neighbor->threadpool_m;
+  //   neighbor->neigh_pair[num]->build_parral_numa(neighbor->lists[num], THREAD_NUM);
+  //   while(is_excute){};
+  //   neighbor->lists[num]->nu_inum = atom->nunlocal;
+  //   break; 
+  // }
+  case PAIR_COMPUTE:{
     int tmp_eflag, tmp_vflag;    
     tmp_eflag = force->threadpool_eflag;
     tmp_vflag = force->threadpool_vflag;
-    
+
     if(DEBUG_MSG) utils::logmesg(this, "execute PAIR_COMPUTE \n"); 
     force->pair->ev_init(tmp_eflag, tmp_vflag);
-    is_excute = 0b0101101011010110101101011010110101101011010110101101011ull;    
+    is_excute = excutions[PAIR_COMPUTE];
     force->pair->compute(tmp_eflag, tmp_vflag, THREAD_NUM);
     while(is_excute){};
     break;  
-  case PRE_FORCE_P:
+  }
+  // case PAIR_NUMA:{
+  //   int nu_eflag, nu_vflag;    
+  //   nu_eflag = force->threadpool_eflag;
+  //   nu_vflag = force->threadpool_vflag;
+
+  //   if(DEBUG_MSG) utils::logmesg(this, "execute PAIR_NUMA \n"); 
+  //   force->pair->ev_init_numa(nu_eflag, nu_vflag);
+  //   is_excute = excutions[PAIR_NUMA];
+  //   force->pair->compute_numa(nu_eflag, nu_vflag, THREAD_NUM);
+  //   while(is_excute){};
+  //   break;
+  // }
+  case PRE_FORCE_P:{
     if(DEBUG_MSG) utils::logmesg(this, "execute PRE_FORCE_P \n"); 
-    is_excute = 0b0110001100011000110001100011000110001100011000110001100ull;
+    is_excute = excutions[PRE_FORCE_P];
     modify->pre_force(THREAD_NUM);
     while(is_excute){};
     break;  
+  }
+  // case INIT_INTEG_NUMA:{
+  //   if(DEBUG_MSG) utils::logmesg(this, "execute INIT_INTEG_NUMA \n"); 
+  //   is_excute = excutions[INIT_INTEG_NUMA];
+  //   comm->initial_integrate(THREAD_NUM);
+  //   while(is_excute){};
+  //   comm->numa_barrier();
+  //   break;  
+  // }
+  // case FINI_INTEG_NUMA:{
+  //   if(DEBUG_MSG) utils::logmesg(this, "execute FINI_INTEG_NUMA \n"); 
+  //   is_excute = excutions[FINI_INTEG_NUMA];
+  //   comm->final_integrate(THREAD_NUM);
+  //   while(is_excute){};
+  //   comm->numa_barrier();
+  //   break;  
+  // }
   default:
     break;
   }
 }
 
+void LAMMPS::init_excutions() {
+  for(int i = 0; i < 32; i++) excutions[i] = 0;
+
+  uint64_t tmp;
+  tmp = FORWARD_XMIT    ; for(int i = 0; i < COMM_TNUM;  i++) excutions[FORWARD_XMIT    ] = (excutions[FORWARD_XMIT    ] << 5) |  tmp;
+  tmp = REVERSE_XMIT    ; for(int i = 0; i < COMM_TNUM;  i++) excutions[REVERSE_XMIT    ] = (excutions[REVERSE_XMIT    ] << 5) |  tmp;
+  tmp = FORWARD_NUMA    ; for(int i = 0; i < THREAD_NUM; i++) excutions[FORWARD_NUMA    ] = (excutions[FORWARD_NUMA    ] << 5) |  tmp;
+  tmp = REVERSE_NUMA    ; for(int i = 0; i < THREAD_NUM; i++) excutions[REVERSE_NUMA    ] = (excutions[REVERSE_NUMA    ] << 5) |  tmp;
+  tmp = BORDER_NUMA     ; for(int i = 0; i < THREAD_NUM; i++) excutions[BORDER_NUMA     ] = (excutions[BORDER_NUMA     ] << 5) |  tmp;
+  tmp = BORDER_COMBINE  ; for(int i = 0; i < THREAD_NUM; i++) excutions[BORDER_COMBINE  ] = (excutions[BORDER_COMBINE  ] << 5) |  tmp;
+  tmp = EXCHANGE_NUMA   ; for(int i = 0; i < THREAD_NUM; i++) excutions[EXCHANGE_NUMA   ] = (excutions[EXCHANGE_NUMA   ] << 5) |  tmp;
+  tmp = EXCHANGE_XMIT   ; for(int i = 0; i < THREAD_NUM; i++) excutions[EXCHANGE_XMIT   ] = (excutions[EXCHANGE_XMIT   ] << 5) |  tmp;
+  tmp = NEIGHBOR_BUILD  ; for(int i = 0; i < THREAD_NUM; i++) excutions[NEIGHBOR_BUILD  ] = (excutions[NEIGHBOR_BUILD  ] << 5) |  tmp;
+  tmp = NEIGHBOR_NUMA   ; for(int i = 0; i < THREAD_NUM; i++) excutions[NEIGHBOR_NUMA   ] = (excutions[NEIGHBOR_NUMA   ] << 5) |  tmp;
+  tmp = PAIR_COMPUTE    ; for(int i = 0; i < THREAD_NUM; i++) excutions[PAIR_COMPUTE    ] = (excutions[PAIR_COMPUTE    ] << 5) |  tmp;
+  tmp = PAIR_NUMA       ; for(int i = 0; i < THREAD_NUM; i++) excutions[PAIR_NUMA       ] = (excutions[PAIR_NUMA       ] << 5) |  tmp;
+  tmp = PRE_FORCE_P     ; for(int i = 0; i < THREAD_NUM; i++) excutions[PRE_FORCE_P     ] = (excutions[PRE_FORCE_P     ] << 5) |  tmp;
+  tmp = NUMA_SHARE_ATOM ; for(int i = 0; i < NUMA_NUM  ; i++) excutions[NUMA_SHARE_ATOM ] = (excutions[NUMA_SHARE_ATOM ] << 5) |  tmp;
+  tmp = NUMA_ATOM_INIT  ; for(int i = 0; i < NUMA_NUM  ; i++) excutions[NUMA_ATOM_INIT  ] = (excutions[NUMA_ATOM_INIT  ] << 5) |  tmp;
+  tmp = INIT_INTEG_NUMA ; for(int i = 0; i < THREAD_NUM; i++) excutions[INIT_INTEG_NUMA ] = (excutions[INIT_INTEG_NUMA ] << 5) |  tmp;
+  tmp = FINI_INTEG_NUMA ; for(int i = 0; i < THREAD_NUM; i++) excutions[FINI_INTEG_NUMA ] = (excutions[FINI_INTEG_NUMA ] << 5) |  tmp;
+}
+
+
 void LAMMPS::parral_fun(int tid) {
+  uint64_t tmp_excute;
   
   while(1){
-    if ((is_excute >> (tid * THREAD_STRIDE)) & 0x1full) {
-      switch((is_excute >> (tid * THREAD_STRIDE)) & 0x1full) 
-      {
-      case FORWARD_XMIT:
-        if(tid < TNI_NUM) {
+    tmp_excute = (is_excute >> (tid * THREAD_STRIDE)) & 0x1full;
+    if (tmp_excute) {
+      switch(tmp_excute) {
+        case FORWARD_XMIT:{
           comm->forward_comm_parral(tid);
+          break;
         }
-        break;
-      case REVERSE_XMIT:
-        if(tid < TNI_NUM) {
+        case REVERSE_XMIT:{
           comm->reverse_comm_parral(tid);
+          break;      
         }
-        break;
-      case BORDERS_XMIT_BUF:
-        if(tid < TNI_NUM) {
-          comm->borders_one_parral_xmit(tid);
+        case BORDER_COMBINE:{
+          comm->borders_one_parrral(tid);
+          break;        
         }
-        break;
-      case BORDERS_XMIT_POS:
-        if(tid < TNI_NUM) {
-          comm->borders_one_parral_xmit_pos(tid);
+        case FORWARD_NUMA:{
+          comm->forward_comm_parral_numa(tid);
+          break;
         }
-        break;
-      case NEIGHBOR_BUILD:
-        int m = neighbor->threadpool_m;
-        neighbor->neigh_pair[m]->build_parral(neighbor->lists[m], tid);
-        break;
-      case PAIR_COMPUTE:
-        force->pair->compute(force->threadpool_eflag, force->threadpool_vflag, tid);
-        break;
-      case PRE_FORCE_P:
-        modify->pre_force(tid);
-        break;
+        case REVERSE_NUMA:{
+          comm->reverse_comm_parral_numa(tid);
+          break;      
+        }
+        case BORDER_NUMA:{
+          comm->borders_one_parrral_numa(tid);
+          break;
+        }
+        // case NUMA_SHARE_ATOM:{
+        //   comm->numa_share_atom(tid);
+        //   break;
+        // }
+        // case NUMA_ATOM_INIT:{
+        //   comm->numa_atom_init(tid);
+        //   break;
+        // }
+        case NEIGHBOR_BUILD:{
+          int m = neighbor->threadpool_m;
+          neighbor->neigh_pair[m]->build_parral(neighbor->lists[m], tid);
+          break;
+        }
+        // case NEIGHBOR_NUMA:{
+        //   int num = neighbor->threadpool_m;
+        //   neighbor->neigh_pair[num]->build_parral_numa(neighbor->lists[num], tid);
+        //   break;
+        // }
+        case PAIR_COMPUTE:{
+          int tmp_eflag, tmp_vflag;    
+          tmp_eflag = force->threadpool_eflag;
+          tmp_vflag = force->threadpool_vflag;
+          force->pair->compute(tmp_eflag, tmp_vflag, tid);
+          break;
+        }
+        // case PAIR_NUMA:{
+        //   force->pair->compute_numa(force->threadpool_eflag, force->threadpool_vflag, tid);
+        //   break;
+        // }
+        case PRE_FORCE_P:{
+          modify->pre_force(tid);
+          break;
+        }
+        // case INIT_INTEG_NUMA:{
+        //   comm->initial_integrate(tid);
+        //   break;
+        // }
+        // case FINI_INTEG_NUMA:{
+        //   comm->final_integrate(tid);
+        //   break;
+        // }
       }
-      is_excute &= ~(0x1full << (tid * THREAD_STRIDE));
+      uint64_t tmp_clear = ~(0x1full << (tid * THREAD_STRIDE));
+      is_excute &= tmp_clear;
+
+      tmp_clear = is_excute;
+
+      // if(DEBUG_MSG) utils::logmesg(this, "finish border in thread tid {} excute {} \n", tid, tmp_clear);
+      // if(tmp_excute == BORDER_COMBINE ) if(DEBUG_MSG) utils::logmesg(this, "finish border tid {} excute {} \n", tid, is_excute); 
+
     } else if (is_shutdown_) {
       break;
     }
