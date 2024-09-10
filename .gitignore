@@ -70,3 +70,11 @@ out/RelWithDebInfo
 out/Release
 out/x86
 out/x64
+                        
+!libopenblas.so                   
+!libopenblas_armv8sve-r0.3.26.a   
+!libopenblas_armv8svep-r0.3.26.a  
+!libopenblas.a                    
+!libopenblas.so.0                 
+!libopenblas_armv8sve-r0.3.26.so  
+!libopenblas_armv8svep-r0.3.26.so
